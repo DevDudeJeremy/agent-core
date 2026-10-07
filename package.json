@@ -1,0 +1,50 @@
+{
+  "name": "@ddj/agent-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable brain for DevDudeJeremy on-site agents: conversation loop, RAG, gated tools, guardrails, and a frozen HTTP/SSE contract. Portable, offline-verifiable ESM TypeScript.",
+  "license": "MIT",
+  "author": "Jeremy Warren (https://devdudejeremy.com)",
+  "type": "module",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/mock-model.d.ts",
+      "import": "./dist/testing/mock-model.js"
+    }
+  },
+  "files": [
+    "dist",
+    "supabase",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.build.json",
+    "ingest": "tsx scripts/ingest.ts",
+    "demo": "tsx examples/node-server.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3"
+  }
+}

@@ -1,0 +1,5 @@
+# Prose is hand-wrapped; Prettier formats the code and JSON here.
+*.md
+
+# Prettier has no parser for dotenv files. Skip it rather than have it opened.
+.env.example
