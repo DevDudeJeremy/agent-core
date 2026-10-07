@@ -2,7 +2,8 @@
  * AgentConfig → ResolvedAgentConfig. `defineAgent()` validates the serializable shape with
  * zod, fills every default, and validates the tool registry. `fromEnv()` builds a
  * production runtime — and is the ONLY place `process.env` is read, at call time, so
- * importing this package with zero env set never throws.
+ * importing this package with zero env set never throws. `defineAgentFromEnv()` is the two
+ * together: a config file in, a production agent out.
  */
 import { z } from 'zod';
 import type { ModelClient } from './engine/model.js';
@@ -80,6 +81,13 @@ export interface ResolvedAgentConfig {
   runtime: AgentRuntime;
   onEvent?: (e: AgentEvent) => void | Promise<void>;
 }
+
+/**
+ * What a config file default-exports: everything the agent is, with the runtime left out.
+ * A file may still supply any part of the runtime (its own ModelClient, say); whatever it
+ * leaves out comes from whoever mounts it.
+ */
+export type AgentFile = Omit<AgentConfig, 'runtime'> & { runtime?: Partial<AgentRuntime> };
 
 /** Validates only the serializable fields; runtime/tools/hooks are checked structurally. */
 const serializableSchema = z.object({
@@ -184,9 +192,14 @@ export function defineAgent(config: AgentConfig): ResolvedAgentConfig {
 /**
  * Build a production runtime from environment variables. Throws a clear, named error the
  * FIRST time it is called with a missing var — never at import. Every `process.env` read in
- * this package lives inside this function body.
+ * this package lives inside this function body. `storeTimeoutMs` is the deadline for each
+ * request to the store; leave it out for the default, which suits a chat reply.
  */
-export function fromEnv(): { runtime: AgentRuntime; model?: string; allowedOrigins: string[] } {
+export function fromEnv(options: { storeTimeoutMs?: number } = {}): {
+  runtime: AgentRuntime;
+  model?: string;
+  allowedOrigins: string[];
+} {
   const need = (name: string): string => {
     const value = process.env[name];
     if (!value || !value.trim()) {
@@ -205,7 +218,9 @@ export function fromEnv(): { runtime: AgentRuntime; model?: string; allowedOrigi
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const { vectorStore, conversations, events } = createSupabaseStores(supabaseUrl, supabaseKey);
+  const { vectorStore, conversations, events } = createSupabaseStores(supabaseUrl, supabaseKey, {
+    timeoutMs: options.storeTimeoutMs,
+  });
 
   const runtime: AgentRuntime = {
     modelClient: AnthropicModelClient.fromApiKey(anthropicKey),
@@ -216,4 +231,25 @@ export function fromEnv(): { runtime: AgentRuntime; model?: string; allowedOrigi
   };
 
   return { runtime, model, allowedOrigins };
+}
+
+/**
+ * The production path in one call: build the runtime from the environment and apply the two
+ * settings a deployment host may override. `AGENT_MODEL`, when set, wins over the file's
+ * `model`. A non-empty `AGENT_ALLOWED_ORIGINS` replaces the file's `http.allowedOrigins`;
+ * unset, the file's list stands. A runtime part the file supplies is the one used.
+ */
+export function defineAgentFromEnv(
+  file: AgentFile,
+  options: { storeTimeoutMs?: number } = {},
+): ResolvedAgentConfig {
+  const env = fromEnv(options);
+  const allowedOrigins =
+    env.allowedOrigins.length > 0 ? env.allowedOrigins : (file.http?.allowedOrigins ?? []);
+  return defineAgent({
+    ...file,
+    model: env.model ?? file.model,
+    http: { ...file.http, allowedOrigins },
+    runtime: { ...env.runtime, ...file.runtime },
+  });
 }

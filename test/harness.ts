@@ -1,6 +1,6 @@
 /**
  * Shared test helpers: build a fully offline agent, drive runTurn while collecting SSE
- * frames, and parse an SSE Response body into frames.
+ * frames, parse an SSE Response body into frames, and read a streamed body up to a marker.
  */
 import {
   defineAgent,
@@ -71,7 +71,11 @@ export interface ParsedFrame {
 
 /** Parse an SSE Response body into frames, ignoring keepalive comment lines. */
 export async function readSSE(res: Response): Promise<ParsedFrame[]> {
-  const text = await res.text();
+  return parseSSE(await res.text());
+}
+
+/** Parse SSE text into frames, ignoring keepalive comment lines. */
+export function parseSSE(text: string): ParsedFrame[] {
   const frames: ParsedFrame[] = [];
   for (const block of text.split('\n\n')) {
     const trimmed = block.trim();
@@ -85,4 +89,36 @@ export async function readSSE(res: Response): Promise<ParsedFrame[]> {
     frames.push({ event, data: data ? JSON.parse(data) : null });
   }
   return frames;
+}
+
+/**
+ * A reader over a streamed body that hands back text. It waits on the stream and on nothing
+ * else: `until()` never resolves if its marker never arrives.
+ */
+export function textReader(body: ReadableStream<Uint8Array>): {
+  until(marker: string): Promise<string>;
+  toEnd(): Promise<string>;
+} {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let seen = '';
+  return {
+    /** Read until `marker` has arrived. Resolves with everything read so far. */
+    async until(marker: string): Promise<string> {
+      while (!seen.includes(marker)) {
+        const { done, value } = await reader.read();
+        if (done) throw new Error(`stream ended before "${marker}" arrived; got: ${seen}`);
+        seen += decoder.decode(value, { stream: true });
+      }
+      return seen;
+    },
+    /** Read to the end. Resolves with everything read, from the first byte. */
+    async toEnd(): Promise<string> {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return (seen += decoder.decode());
+        seen += decoder.decode(value, { stream: true });
+      }
+    },
+  };
 }

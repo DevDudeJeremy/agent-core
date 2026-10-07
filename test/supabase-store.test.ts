@@ -1,14 +1,22 @@
 /**
  * The Supabase store, driven offline. `fetch` is replaced by a stub that records each
- * request and answers the way PostgREST would, then the network kill switch is put back.
+ * request and answers with canned replies, then the network kill switch is put back.
  *
  * What this proves: the order and the bodies of the requests supabase-js sends for
- * `upsertDocument` and `appendMessage`, and that an error response becomes a thrown Error.
- * What it cannot prove: that Postgres accepts any of them (the vector cast, the upsert's
- * conflict target, row-level security). Those stay on the README's list of live checks.
+ * `upsertDocument`, `appendMessage` and the event sink, that an error response becomes a
+ * thrown Error, and that a store which is down is tried once and given up on by a deadline.
+ * What it cannot prove: that PostgREST and Postgres accept any of them. test/postgres.test.ts
+ * runs the SQL side (the vector cast, the conflict target, the uuid column, row-level
+ * security); the hop between the two is on the README's list of live checks.
  */
-import { afterEach, describe, it, expect } from 'vitest';
-import { createSupabaseStores, FeatureHashEmbeddings, ingestDocuments } from '../src/index.js';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import {
+  createSupabaseStores,
+  DEFAULT_STORE_TIMEOUT_MS,
+  FeatureHashEmbeddings,
+  ingestDocuments,
+  makeEvent,
+} from '../src/index.js';
 
 interface Recorded {
   method: string;
@@ -21,6 +29,7 @@ type Reply = { status: number; body?: unknown };
 const killSwitch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = killSwitch;
+  vi.useRealTimers();
 });
 
 /** Install a recording stub. `reply` decides each response; the default is a plain success. */
@@ -112,7 +121,10 @@ describe('Supabase store write order (SPEC §9.19)', () => {
     let storedHash = '';
     const calls = stubSupabase((r) => {
       if (r.table !== 'agent_documents') return undefined;
-      if (r.method === 'GET') return { status: 200, body: { content_hash: storedHash } };
+      // The hash lookup does not ask for a single object, so PostgREST answers with a list.
+      if (r.method === 'GET') {
+        return { status: 200, body: storedHash ? [{ content_hash: storedHash }] : [] };
+      }
       storedHash = (r.body as { content_hash: string }).content_hash;
       return r.method === 'POST' ? documentRow : undefined;
     });
@@ -151,5 +163,111 @@ describe('Supabase store write order (SPEC §9.19)', () => {
 
   it('puts the network kill switch back', async () => {
     await expect(fetch('https://example.invalid/')).rejects.toThrow(/Network access is disabled/);
+  });
+});
+
+describe('the event sink (SPEC §9.27)', () => {
+  it('stores an event that has no conversation as NULL, and one that has as its id', async () => {
+    const calls = stubSupabase();
+    const { events } = stores();
+    const cid = '3f2b8c1e-6d0a-4c57-9a3e-0b1d2c3e4f5a';
+
+    await events.write(makeEvent('error', '', { message: 'store down' }));
+    await events.write(makeEvent('user_message', cid, { message: 'hi' }));
+
+    expect(calls.map((c) => `${c.method} ${c.table}`)).toEqual([
+      'POST agent_events',
+      'POST agent_events',
+    ]);
+    // NULL fits the uuid column. test/postgres.test.ts shows Postgres taking it, and
+    // refusing a placeholder that is not a uuid.
+    expect(calls[0]!.body).toEqual({
+      conversation_id: null,
+      type: 'error',
+      payload: { message: 'store down' },
+    });
+    expect(calls[1]!.body).toEqual({
+      conversation_id: cid,
+      type: 'user_message',
+      payload: { message: 'hi' },
+    });
+  });
+});
+
+// Both tests run on the test runner's clock, so nothing here waits in real time.
+describe('a store that is down (SPEC §9.29)', () => {
+  it('a read that cannot connect is tried once and fails', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts++;
+      throw new TypeError('fetch failed');
+    }) as typeof fetch;
+
+    const outcome = stores()
+      .vectorStore.getDocumentHash('faq.md')
+      .then(
+        () => 'resolved',
+        (err: Error) => err.message,
+      );
+    // Let every wait the client might have wanted run out. Retries, if there were any,
+    // would all happen here.
+    await vi.runAllTimersAsync();
+
+    expect(attempts).toBe(1);
+    expect(await outcome).toMatch(/getDocumentHash failed.*fetch failed/);
+  });
+
+  it('a request that never answers is abandoned at the deadline, and not before', async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    // Answers only by failing when the caller gives up on it.
+    globalThis.fetch = ((_input: unknown, init?: RequestInit) => {
+      attempts++;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+      });
+    }) as typeof fetch;
+
+    let outcome = 'pending';
+    const call = stores()
+      .conversations.get('3f2b8c1e-6d0a-4c57-9a3e-0b1d2c3e4f5a')
+      .then(
+        () => (outcome = 'resolved'),
+        (err: Error) => (outcome = err.message),
+      );
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_STORE_TIMEOUT_MS - 1);
+    expect(outcome).toBe('pending');
+
+    // Asserted before `call` is awaited: with no deadline there would be nothing to await.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(outcome).toMatch(/conversation get failed/);
+    await call;
+    expect(attempts).toBe(1);
+    expect(DEFAULT_STORE_TIMEOUT_MS).toBe(2000);
+  });
+
+  it('the deadline is the caller’s to set', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = ((_input: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+      })) as typeof fetch;
+    const slow = createSupabaseStores('http://supabase.test', 'test-service-role-key', {
+      timeoutMs: 60_000,
+    });
+
+    let outcome = 'pending';
+    const call = slow.vectorStore.getDocumentHash('faq.md').then(
+      () => (outcome = 'resolved'),
+      (err: Error) => (outcome = err.message),
+    );
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(outcome).toBe('pending');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(outcome).toMatch(/getDocumentHash failed/);
+    await call;
   });
 });

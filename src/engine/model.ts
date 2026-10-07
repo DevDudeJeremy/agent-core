@@ -1,6 +1,8 @@
 /**
  * The model seam. Everything talks to `ModelClient`; only THIS file imports
- * `@anthropic-ai/sdk` (isolation rule, SPEC §3). Tests inject a scripted MockModelClient.
+ * `@anthropic-ai/sdk` (isolation rule, SPEC §3). Most tests inject a scripted
+ * MockModelClient; test/anthropic-client.test.ts runs AnthropicModelClient through the real
+ * SDK against a replay of the documented stream (SPEC §9.20).
  * The Anthropic stream-event mapping is intentionally defensive: shapes are probed, not
  * assumed, so an SDK point release cannot silently break the loop.
  */

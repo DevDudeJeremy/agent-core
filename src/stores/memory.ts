@@ -11,7 +11,8 @@
  *    whatever their distance;
  *  - ties are broken by chunk id here; the SQL has no tie-breaker, so equal-ranked rows
  *    come back in whatever order Postgres picks.
- * Ranking on real Postgres is on the README's list of live checks.
+ * test/postgres.test.ts runs the same fixtures through this store and through the SQL on a
+ * real Postgres, and asserts each of these differences.
  */
 import type {
   Conversation,

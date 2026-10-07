@@ -18,7 +18,8 @@ always points at the **full base**, and the widget appends the paths below.
 ## 2. Endpoints
 
 **`GET {base}/health`** → `200` `{"ok":true,"version":"<pkg version>","protocolVersion":1}`.
-No auth. For uptime checks.
+No auth. For uptime checks. It carries `Access-Control-Allow-Origin: *` whatever the
+allowlist says, so a page on any origin can read it: it is public and holds no secret.
 
 **`POST {base}/chat`** — `Content-Type: application/json`:
 

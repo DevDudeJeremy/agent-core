@@ -8,7 +8,7 @@ import {
 } from '../src/index.js';
 import type { ConversationStore, ModelClient, ModelEvent } from '../src/index.js';
 import { MockModelClient, textDelta, stop } from '../src/testing/mock-model.js';
-import { readSSE } from './harness.js';
+import { parseSSE, readSSE, textReader } from './harness.js';
 
 const ORIGIN = 'https://ok.example';
 
@@ -57,6 +57,23 @@ describe('HTTP contract fidelity (SPEC §9.9, docs/http-contract.md)', () => {
     const res = await handler(new Request('http://host/agent/health'));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, version: '0.1.0', protocolVersion: 1 });
+  });
+
+  it('health is readable from any origin; chat keeps the allowlist (SPEC §9.28)', async () => {
+    const handler = makeHandler(new MockModelClient([]));
+    const stranger = { origin: 'https://not-on-the-list.example' };
+
+    // With no Origin, with a listed one, and with one the allowlist refuses.
+    for (const headers of [{}, { origin: ORIGIN }, stranger]) {
+      const res = await handler(new Request('http://host/agent/health', { headers }));
+      expect(res.status).toBe(200);
+      expect(res.headers.get('access-control-allow-origin')).toBe('*');
+    }
+
+    // The same stranger is still refused where it matters.
+    const chat = await handler(chatReq({ message: 'hi' }, stranger));
+    expect(chat.status).toBe(403);
+    expect(chat.headers.get('access-control-allow-origin')).toBeNull();
   });
 
   it('POST {base}/chat → SSE with meta first, text, terminal done + correct headers', async () => {
@@ -154,6 +171,41 @@ describe('HTTP contract fidelity (SPEC §9.9, docs/http-contract.md)', () => {
     expect(frames.at(-1)!.event).toBe('error');
     expect((frames.at(-1)!.data as { code: string }).code).toBe('server_error');
   });
+
+  it('streams: the first text frame is on the wire while the model is still mid-reply (SPEC §9.21)', async () => {
+    // A model that stops after its first delta until the test lets it go on. No timers. If
+    // the handler or the loop held frames back until the turn was over, the model would
+    // wait on the test and the test on the model, and this could only end by timing out.
+    let letGo!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      letGo = resolve;
+    });
+    let produced = 0;
+    const pausing: ModelClient = {
+      async *stream(): AsyncIterable<ModelEvent> {
+        produced++;
+        yield { type: 'text_delta', delta: 'first ' };
+        await gate;
+        produced++;
+        yield { type: 'text_delta', delta: 'last' };
+        yield { type: 'stop', reason: 'end_turn' };
+      },
+    };
+    const res = await makeHandler(pausing)(chatReq({ message: 'hi' }));
+    const wire = textReader(res.body!);
+
+    const early = await wire.until('"delta":"first "');
+
+    // The reader holds the first text frame; the model has produced one delta, not two.
+    expect(parseSSE(early).map((f) => f.event)).toEqual(['meta', 'text']);
+    expect(early).toContain('"delta":"first "');
+    expect(produced).toBe(1);
+
+    letGo();
+    const all = parseSSE(await wire.toEnd());
+    expect(all.map((f) => f.event)).toEqual(['meta', 'text', 'text', 'done']);
+    expect(all[2]!.data).toEqual({ delta: 'last' });
+  }, 3000);
 
   it('unexpected failure before the stream opens → 500 server_error', async () => {
     // The client key is read before any stream exists; make that step throw.

@@ -31,7 +31,7 @@ Needs npm and Node 22 (22.12 or newer), Node 24, or Node 26 and later. `.nvmrc` 
 ```bash
 npm ci          # or npm install: both leave package-lock.json untouched
 npm run check   # tsc --noEmit over src, tests, examples and scripts
-npm test        # 50 tests, with fetch replaced by a function that throws
+npm test        # 116 tests, with fetch replaced by a function that throws
 npm run build   # tsc -> dist/
 ```
 
@@ -69,6 +69,47 @@ event: done
 data: {"finishReason":"end_turn"}
 ```
 
+That reply is canned, and the frames are paced a little so you can watch them arrive. To
+see an agent that is nothing but a config file and a folder of content, stop the server
+and start it again with both:
+
+```bash
+npm run demo -- --config examples/client-agent.example.ts --content examples/client-content.example
+```
+
+Then ask it something the folder covers:
+
+```bash
+curl -N -X POST http://localhost:8787/agent/chat \
+  -H 'content-type: application/json' -d '{"message":"Do you fix water heaters?"}'
+```
+
+```text
+event: meta
+data: {"protocolVersion":1,"conversationId":"<uuid>"}
+
+event: text
+data: {"delta":"From services.md:"}
+
+event: text
+data: {"delta":"\nServices > Water heaters"}
+
+event: text
+data: {"delta":"\nWe repair and replace gas and electric water heaters. Most replacements are done the same day."}
+
+event: done
+data: {"finishReason":"end_turn"}
+```
+
+No model wrote that. Offline, a stand-in takes the model's place, and all it does is quote
+the passage retrieval ranked first and name the file it came from. That's enough to watch
+a business's own content come back through the loop and over the wire with no key.
+"Ranked first" means shared words here, so ask it something off-topic and it may still
+quote you something. Swap the config and the folder for another business and you have
+another agent, with nothing under `src/` touched:
+[`test/new-agent.test.ts`](test/new-agent.test.ts) does exactly that with a bookshop it
+makes up on the spot.
+
 And the chunker will happily chew on this repo's own docs — no embedding call, no keys:
 
 ```bash
@@ -83,7 +124,7 @@ All the scripts:
 | `npm test` | The offline suite, once. |
 | `npm run test:watch` | The suite in watch mode. |
 | `npm run build` | `tsc` to `dist/` (`src` only). |
-| `npm run demo` | The local Node server, in offline demo mode when no env is set. |
+| `npm run demo` | The local Node server, in offline demo mode when no env is set. `-- --config <file> --content <dir>` serves that agent; `--pace <ms>` sets how fast the offline stand-ins talk (default 150, `0` for all at once). |
 | `npm run ingest -- --dir <path> [--dry-run]` | Chunk, embed and store content. `--dry-run` only counts chunks. |
 | `npm run format` | Prettier over the code and JSON (single quotes, 100 columns). |
 | `npm run format:check` | Exits non-zero if `format` would change a file. |
@@ -130,7 +171,8 @@ The choices behind it — the spec records what the big ones were chosen over:
   the Node adapter is written and has been run
   ([`examples/node-server.ts`](examples/node-server.ts)); the others are untried.
 - **The model is behind an interface.** Everything talks to `ModelClient`. One file
-  imports the Anthropic SDK; the tests inject a scripted `MockModelClient`.
+  imports the Anthropic SDK; most tests inject a scripted `MockModelClient`, and one runs
+  the real client through the real SDK against a replay of the documented stream.
 - **Plain Messages API, not an agent framework.** The job is a short, bounded,
   auditable tool loop with a fixed set of actions. That's a call about matching the tool
   to the job, not a default.
@@ -139,6 +181,12 @@ The choices behind it — the spec records what the big ones were chosen over:
   two rankings are fused with RRF (k = 60) inside one SQL function, so retrieval is one
   round trip. A reranker hook sits after it. Full-text finds exact terms (a product name,
   a policy number) that vectors blur; vectors find paraphrases that full-text misses.
+  One thing to know before you lean on that: the visitor's whole message is the keyword
+  query, and Postgres wants every word of it in the passage. Ask the example content "Do
+  you fix water heaters?" and the keyword half finds nothing, because no passage says
+  "fix"; "water heaters" on its own finds one. So a full-sentence question is carried by
+  the vector half, and the keyword half earns its place on short, exact queries. Sending
+  it something smarter than the raw message is a design decision this package hasn't made.
 - **Gates are enforced in code, not in the prompt.** A prompt can be talked out of a
   rule; a loop that never calls a gated tool's `run()` can't. A tool marked
   `human-approval` is never executed by the loop. Its input is recorded as an
@@ -160,56 +208,64 @@ test name points at a section of it.
 
 ## How the tests work
 
-`npm test` runs 50 tests in nine files and needs no network — and that isn't on the
+`npm test` runs 116 tests in thirteen files and needs no network — and that isn't on the
 honour system. [`test/setup.ts`](test/setup.ts) replaces the global `fetch` with a
 function that throws, so a test that reached for a paid service through `fetch` would
-fail instead of going online. (One file swaps in a recording stub for its own tests, then
-puts the thrower back.)
+fail instead of going online. (Four files swap in a stub of their own for some tests,
+then put the thrower back.)
 
 Offline tests only work because stand-ins take the place of the real services, and a
-stand-in is worth exactly as much as you're honest about it. So here are the four, with
+stand-in is worth exactly as much as you're honest about it. So here are the seven, with
 what each one **cannot** prove:
 
 | Stand-in | Replaces | What it cannot prove |
 | --- | --- | --- |
-| `MockModelClient` (scripted turns) | Claude | Anything about the real stream. `AnthropicModelClient` is typechecked but never called by a test. |
-| `FeatureHashEmbeddings` (deterministic word hashing) | Voyage embeddings | Retrieval quality. It proves the pipeline and the fusion arithmetic, not that the best passage ranks first on real text. |
-| Memory stores | Supabase (pgvector + Postgres) | The SQL itself. The memory store repeats the fusion arithmetic with a word-count stand-in for `ts_rank`; the migration is never executed (one test reads it as text, to check its two constants). |
-| A recording `fetch` stub with canned replies | The Supabase HTTP API, for two write paths | That Postgres accepts the requests. It proves the order and bodies of what supabase-js sends for `upsertDocument` and `appendMessage`; the rest of the Supabase store is typechecked only. |
+| `MockModelClient` (scripted turns) | Claude, in most tests | Anything about the real stream. It drives the loop; the real client has the next row. |
+| A replay of Anthropic's documented stream, through the real SDK | The Anthropic API | That the live service sends this today, or accepts these requests. The stream is written out from the published streaming reference, event for event. It is not a recording of a call. |
+| A stand-in that only quotes (`examples/offline-runtime.ts`) | Claude, in the config demo and its test | That a model answers well from a passage. It shows the right passage came back, and nothing about language. |
+| `FeatureHashEmbeddings` (deterministic word hashing) | Voyage embeddings | Retrieval quality. It proves the pipeline and the fusion arithmetic, not that the best passage ranks first on real text. `VoyageEmbeddings` itself is typechecked and never called. |
+| Memory stores | Supabase (pgvector + Postgres) | How Postgres ranks. The memory store repeats the fusion arithmetic and approximates the rest; one test runs the same fixtures through both and asserts where they part ways. |
+| PGlite (Postgres with pgvector, compiled to WebAssembly, in the test process) | A Supabase project's database | Anything about Supabase's own layer. The SQL is really executed, but there is no PostgREST in front of it, the roles are made by the test to stand for Supabase's, and the Postgres version is PGlite's. |
+| A recording `fetch` stub with canned replies | The Supabase HTTP API | That PostgREST accepts the requests. It proves the order and bodies of what supabase-js sends for `upsertDocument`, `appendMessage` and the event sink, and that a store which is down is tried once and given up on by a deadline. One call, `ddj_match_chunks`, is answered by the real function instead of a canned reply. |
 
 What each file checks:
 
 | File | Checks |
 | --- | --- |
-| `test/conversation.test.ts` | Text streams in order and is saved; a tool call is validated, run and answered; bad tool input fails without stopping the loop; a model that never stops is cut off at `maxTurns`; exactly the newest `historyWindow` messages reach the model, and the window never opens on an assistant turn; the exact sequence of logged events; tool inputs never appear on the wire. |
+| `test/conversation.test.ts` | Text streams in order and is saved; a tool call is validated, run and answered; bad tool input fails without stopping the loop; a model that never stops is cut off at `maxTurns`; exactly the newest `historyWindow` messages reach the model, and the window never opens on an assistant turn; a tool the agent was not given is never run, the model is told, and the turn carries on; an error before a conversation exists is logged with no conversation id, and the `onEvent` hook hears of an error even when the sink is down; the exact sequence of logged events; tool inputs never appear on the wire. |
 | `test/gates.test.ts` | A `human-approval` tool is never run, an `approval_required` event carries its input, and the model is told it is queued. |
 | `test/handoff.test.ts` | A `request_human_handoff` call logs `handoff_requested`, sets the conversation to `handed_off` and sends a `handoff` frame with the reason, checked on the loop's frames and on the wire; the turn still ends with `done`. With no such call, with a different tool running, or with invalid input, nothing is handed off. |
 | `test/retrieve.test.ts` | A vector-only match and a keyword-only match both surface; the fused scores match the RRF formula for known ranks; k = 60 and 12 candidates per channel are pinned as literals, in the memory store's results, and in the text of the SQL function, which the migrations must define exactly once; the reranker can reorder; `topK` holds; re-ingesting unchanged content makes no embedding call and no write; changed content replaces that document's chunks. |
 | `test/chunk.test.ts` | Chunking is deterministic, respects the size limit and the overlap, never crosses a heading, and prefixes each chunk with its heading path. |
 | `test/prompt.test.ts` | The fixed guardrails always come first; business rules come after; the context block is marked untrusted and names its sources. |
-| `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`. |
-| `test/supabase-store.test.ts` | Against the recording stub: `upsertDocument` writes a `pending:` marker, replaces the chunks, then writes the real content hash; a failed chunk insert throws and the real hash is never written; ingest runs a document again while its stored hash is the marker; `appendMessage` throws when its `last_active_at` update fails; the network kill switch is back afterwards. |
-| `test/lockfile.test.ts` | `vite` is a direct devDependency, none of the bundler is recorded as peer-only in the lockfile, and the native binaries for macOS, Linux and Windows are listed. This is what keeps a plain `npm install` from stripping the lockfile. |
+| `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`; the first `text` frame reaches the reader while the model is still mid-reply; `health` is readable from any origin while `chat` keeps the allowlist. |
+| `test/anthropic-client.test.ts` | `AnthropicModelClient` through the real SDK, against the documented stream: text deltas arrive in order; a tool call is put back together from its `input_json_delta` fragments; each stop reason maps; the request is the one the Messages API documents. Then the loop on top of it: a two-request tool round trip whose second request carries the `tool_result`; a tool call cut off by `max_tokens` is not run; an `error` event mid-stream and a refused key each end the turn with an `error` frame; and the first frame reaches the HTTP reader while the upstream response is still open. The SDK's own `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_CUSTOM_HEADERS` end up on the request, as the variables section says. |
+| `test/postgres.test.ts` | On real Postgres with pgvector: the migration applies as written, twice; a vector-only and a keyword-only match both surface with the RRF scores for hand-set ranks; each channel is cut at 12; a multi-word query follows `websearch_to_tsquery`; a role that may not bypass row-level security reads and writes nothing, and one that may does both; the constraints the stores lean on hold. The same fixtures run through the memory store, and each difference is asserted. On the shipped example content, a full-sentence question matches nothing by keyword and the vector half still puts the right passage first. |
+| `test/new-agent.test.ts` | A config file and a content folder that the test writes become an agent that answers from that folder, as that business, on the path its config names; the shipped example stands up the same way beside it and neither sees the other's content; a config can bring its own model. Offline, the event log names the stand-in that answered, never a Claude model, and the no-config demo's reply is the one the quick start shows. |
+| `test/from-env.test.ts` | The production path, with made-up values in the environment: `defineAgentFromEnv` lets the host's `AGENT_MODEL` and `AGENT_ALLOWED_ORIGINS` win when they are set and the config's stand when they are not; with no allowlist anywhere a browser is refused; a runtime part the config supplies is kept; a missing variable is named. The store's deadline is the one asked for: through `fromEnv`, through `defineAgentFromEnv`, and in the ingest script, which gives it 60 seconds. A dry-run ingest needs no environment at all. |
+| `test/supabase-store.test.ts` | Against the recording stub: `upsertDocument` writes a `pending:` marker, replaces the chunks, then writes the real content hash; a failed chunk insert throws and the real hash is never written; ingest runs a document again while its stored hash is the marker; `appendMessage` throws when its `last_active_at` update fails; an event with no conversation is sent as NULL; a read that cannot connect is tried once, and a request that never answers is dropped at the deadline; the network kill switch is back afterwards. |
+| `test/lockfile.test.ts` | `vite` is a direct devDependency, nothing is recorded as peer-only in the lockfile, and the native binaries for macOS, Linux and Windows are listed. This is what keeps a plain `npm install` from stripping the lockfile. Every package comes from `registry.npmjs.org` with an integrity hash, and only `esbuild` and `fsevents` are flagged as running a script at install. The declared `@supabase/supabase-js` range starts at the first release that has the two options the store sets. |
 
 ### What the offline suite does not cover
 
-The offline suite can't reach these five. They are implemented and typechecked, have
-never met the real world, and each needs one live check before a first real deployment:
+The offline suite can't reach these four. It tests three of them against a stand-in and
+only typechecks the fourth, and a stand-in is not the service: each needs one live check
+before a first real deployment.
 
-1. **Supabase round trip.** The `[…]` vector literal must cast to `vector(1024)` on
-   insert and as the RPC argument, and the RPC rows must map into `RetrievedChunk`.
-   Also confirm that a store call fails promptly when the network is down, and that a
-   failed chunk insert leaves the document to be ingested again: `upsertDocument`'s
-   write order (a `pending:` hash, delete, insert, the real hash) is tested only
-   against a stub.
-2. **Ranking on real Postgres.** `ddj_match_chunks` with pgvector and
-   `websearch_to_tsquery` / `ts_rank`.
-3. **The Anthropic stream.** One live call through `AnthropicModelClient.stream` with a
-   tool call split across several `input_json_delta` events, and one conversation longer
-   than `historyWindow`, to confirm the trimmed window is accepted.
-4. **Voyage.** The real response shape and a 1024-dimension vector.
-5. **Row-level security.** After applying the migration, confirm that only the
-   service-role key can reach any `agent_` table.
+1. **The Anthropic API.** One live call through `AnthropicModelClient.stream` that ends in
+   a tool call, and one conversation longer than `historyWindow`. The suite proves the
+   client against the stream Anthropic documents. Only a call proves the service still
+   sends it, and accepts the model id and the tool schemas this package generates.
+2. **Voyage.** The real response shape and a 1024-dimension vector. This is the one the
+   suite only typechecks.
+3. **Supabase's API in front of the SQL.** The stores reach Postgres through PostgREST. The
+   suite runs the SQL and checks what supabase-js sends, and joins the two for a single
+   call. Run one ingest and one retrieval against a real project: the `[…]` vector literal
+   on insert and as the RPC argument, the upsert, and a failed chunk insert leaving the
+   document to be ingested again.
+4. **Row-level security as deployed.** The suite shows that a role which may not bypass
+   it reads nothing. After applying the migration, confirm with the project's own anon key
+   that no `agent_` table can be read.
 
 ## Using it for a real agent
 
@@ -218,7 +274,8 @@ Six steps, and none of them is "edit the core":
 1. Copy [`examples/client-agent.example.ts`](examples/client-agent.example.ts) to
    `agent.config.ts` and fill in the business, persona, tools and allowed origins. Repoint
    its two imports: `'../src/index.js'` becomes `'./src/index.js'` when the copy sits at
-   the package root.
+   the package root. The file holds everything but the runtime, so you can try it before
+   any key exists: `npm run demo -- --config agent.config.ts --content ./knowledge`.
 2. Copy `.env.example` to `.env` **on the deployment host** and fill it in. Secrets never
    go in the repository.
 3. Apply the migration to the Supabase project the agent will use (see below).
@@ -231,7 +288,11 @@ Six steps, and none of them is "edit the core":
 
    Ingest is idempotent. A content hash is checked before embedding, so unchanged files
    cost nothing; a changed file replaces all of that document's chunks.
-5. Mount `createAgentHandler(agent)` behind your platform's adapter.
+5. Mount it behind your platform's adapter:
+   `createAgentHandler(defineAgentFromEnv(config))`. That one call builds the production
+   runtime from the environment and applies the host's two overrides (the table below).
+   [`examples/node-server.ts`](examples/node-server.ts) does that for Node when you pass
+   it `--config` with the env set.
 6. Point the chat widget at the agent's base URL
    ([`docs/http-contract.md`](docs/http-contract.md)).
 
@@ -239,15 +300,22 @@ Six steps, and none of them is "edit the core":
 
 Server-side only. Never expose them to the browser. Env is read only inside `fromEnv()`,
 when it is called, so importing the package with nothing set never throws.
+`defineAgentFromEnv(config)` calls it and applies the two overrides in this table; call
+`fromEnv()` yourself and it only hands them back.
+
+Five reads aren't this package's. Even with the key passed in, the Anthropic SDK looks at
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG`
+and `ANTHROPIC_WEBHOOK_SIGNING_KEY` when that client is built. A host that sets one of the
+first three is changing where the agent's model calls go, or what they carry.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | yes | Anthropic Messages API. |
-| `AGENT_MODEL` | no | Model override; defaults to `claude-haiku-4-5`. |
+| `AGENT_MODEL` | no | Model override. When set it wins over the config's `model`; with neither, `claude-haiku-4-5`. |
 | `VOYAGE_API_KEY` | yes | Voyage embeddings for RAG. |
 | `SUPABASE_URL` | yes | Supabase project URL. |
 | `SUPABASE_SERVICE_ROLE_KEY` | yes | Service-role key. Full access, server-side only. |
-| `AGENT_ALLOWED_ORIGINS` | for browsers | Comma-separated CORS allowlist. `fromEnv()` does not insist on it: unset means an empty list, and every browser origin is refused. |
+| `AGENT_ALLOWED_ORIGINS` | no | Comma-separated CORS allowlist. When set it replaces the config's `http.allowedOrigins`; unset, the config's list stands. With no list in either, every browser origin is refused. |
 
 ### Applying the migration
 
@@ -279,6 +347,20 @@ Worth knowing before it's in front of real visitors:
   vouches for. The limiter never evicts a key it has seen.
 - `historyWindow` is an upper bound. The window is trimmed so the request opens on a
   visitor message, so the model may see fewer messages than the setting.
+- A full-sentence question usually gets nothing from the keyword half of retrieval on
+  real Postgres, because every word of it has to be in the passage. The vector half
+  decides what comes back; short, exact queries are where keyword matching helps.
+  [`test/postgres.test.ts`](test/postgres.test.ts) pins this on the example content.
+- A reply can come back empty. If the model runs out of `maxTokens` part-way through a
+  tool call, the call is dropped, rightly, and the turn ends with `done` and no text. The
+  `model_call` event for that turn says `stopReason: "max_tokens"`. If those show up,
+  raise `maxTokens`.
+- A store that is down fails fast. Each request to Supabase is tried once and given two
+  seconds, so the visitor gets an `error` frame while they're still there.
+  `defineAgentFromEnv(config, { storeTimeoutMs })` changes the deadline; the ingest script
+  uses 60 seconds, because one request carries every chunk of a document.
+- `GET {base}/health` can be read from any origin. It is public and holds no secret. The
+  chat endpoint keeps the allowlist.
 
 ## Layout
 
@@ -293,10 +375,12 @@ src/
   stores/            interfaces, memory stores, Supabase stores
   testing/           MockModelClient (exported as "@ddj/agent-core/testing")
 test/                the offline suite
-examples/            a Node server and a filled-in agent config
-scripts/ingest.ts    the content ingest CLI
+examples/            a Node server, a config loader, the offline stand-ins, and one
+                     example agent: a config file and its content folder
+scripts/             the content ingest CLI and the folder reader it shares
 supabase/migrations/ the schema and the retrieval function
 docs/                the design spec and the HTTP/SSE contract
+.github/workflows/   the CI gate: the quick start's commands on three systems
 ```
 
 ## License

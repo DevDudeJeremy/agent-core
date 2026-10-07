@@ -5,3 +5,5 @@ dist/
 !.env.example
 *.log
 .DS_Store
+# Scratch agents written by test/new-agent.test.ts; it removes its own.
+.tmp-agent-*/

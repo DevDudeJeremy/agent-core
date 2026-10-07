@@ -19,6 +19,7 @@ export type AgentEventType =
 
 export interface AgentEvent {
   type: AgentEventType;
+  /** '' on an `error` raised before a conversation was loaded or created. */
   conversationId: string;
   /** ISO 8601 timestamp. */
   at: string;

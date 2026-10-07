@@ -1,0 +1,62 @@
+# The gate. Every push and every pull request gets the four commands of the README's quick
+# start and the format check, on three operating systems and on Node 22, 24 and 26, plus a
+# check that a plain `npm install` leaves the lockfile alone.
+#
+# It needs no secrets: the suite runs with no API keys and no network beyond the install.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - run: npm run format:check
+
+  # `npm ci` never rewrites the lockfile, so it cannot notice a lockfile that a plain
+  # `npm install` would change. This job can. Node 22 brings npm 10, and Node 24 and 26
+  # bring npm 11, so both npm lines are covered.
+  lockfile:
+    name: npm install keeps the lockfile (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - name: package-lock.json is unchanged
+        run: git diff --exit-code -- package-lock.json
+      - run: npm test

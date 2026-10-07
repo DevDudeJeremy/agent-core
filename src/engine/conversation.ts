@@ -263,10 +263,22 @@ export async function runTurn(params: RunTurnParams): Promise<void> {
     sse({ event: 'done', data: { finishReason } });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
+    // `conversationId` is still '' when the turn failed before a conversation was loaded or
+    // created. That is what gets logged: the Supabase sink stores '' as NULL, where any
+    // other placeholder would be refused by the uuid column.
+    const failure = makeEvent('error', conversationId, { message: detail });
+    // The sink and the hook are told separately, not through dispatch(). A sink that is down
+    // is a likely reason to be here, and it must not keep the hook from hearing about it.
+    // Neither failure may mask the original error or the terminal frame.
     try {
-      await dispatch(makeEvent('error', conversationId || 'unknown', { message: detail }));
+      await events.write(failure);
     } catch {
-      // A sink failure must not mask the original error or the terminal frame.
+      // The hook is still told, below.
+    }
+    try {
+      if (onEvent) await onEvent(failure);
+    } catch {
+      // The terminal frame is still sent, below.
     }
     sse({
       event: 'error',

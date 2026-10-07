@@ -4,11 +4,13 @@
  * supabase/migrations/20260705000000_agent_core.sql already exists — it NEVER runs DDL.
  * `query()` calls the `ddj_match_chunks` RPC (the RRF fusion lives in SQL).
  *
- * Note: almost none of this runs offline. test/supabase-store.test.ts checks the write
- * order of `upsertDocument` and the error handling of `appendMessage` against a recording
- * fetch stub; nothing here has run against a real project. It typechecks and follows
- * supabase-js conventions; live behaviour has to be validated against a real project
- * (README, "What the offline suite does not cover").
+ * Note: little of this runs offline. test/supabase-store.test.ts checks, against a
+ * recording fetch stub, the write order of `upsertDocument`, the error handling of
+ * `appendMessage`, what the event sink sends for an event with no conversation, and that a
+ * store which is down fails on the first attempt and by a deadline. test/postgres.test.ts
+ * runs the SQL these calls rely on. The two are never joined by a real PostgREST in the
+ * suite; that hop has to be validated against a real project (README, "What the offline
+ * suite does not cover").
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
@@ -28,6 +30,17 @@ import type { AgentEvent, EventSink } from '../engine/events.js';
  * real SHA-256 digest, so an ingest that died part-way is run again instead of skipped.
  */
 const PENDING_PREFIX = 'pending:';
+
+/**
+ * How long one request to the store may take before it is abandoned. A visitor is waiting
+ * on most of these, so the default is short; the ingest CLI asks for longer.
+ */
+export const DEFAULT_STORE_TIMEOUT_MS = 2_000;
+
+export interface SupabaseStoreOptions {
+  /** Deadline for each request, in milliseconds. Defaults to DEFAULT_STORE_TIMEOUT_MS. */
+  timeoutMs?: number;
+}
 
 /** pgvector wants a bracketed literal, not a JSON array. */
 function toVectorLiteral(embedding: number[]): string {
@@ -207,9 +220,14 @@ function rowToConversation(row: Record<string, unknown>): Conversation {
 export function createSupabaseStores(
   url: string,
   serviceKey: string,
+  options: SupabaseStoreOptions = {},
 ): { vectorStore: VectorStore; conversations: ConversationStore; events: EventSink } {
   const client = createClient(url, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
+    // Left alone, supabase-js retries a failed read three times, waiting 1, 2 and 4 seconds,
+    // and sets no deadline: a store that is down took seven seconds to say so. One attempt,
+    // and a deadline, so the turn fails while the visitor is still there to be told.
+    db: { retry: false, timeout: options.timeoutMs ?? DEFAULT_STORE_TIMEOUT_MS },
   });
   return {
     vectorStore: new SupabaseVectorStore(client),

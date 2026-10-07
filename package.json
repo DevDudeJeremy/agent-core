@@ -36,10 +36,12 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
-    "@supabase/supabase-js": "^2.45.4",
+    "@supabase/supabase-js": "^2.112.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@electric-sql/pglite-pgvector": "0.0.9",
     "@types/node": "^22.7.4",
     "prettier": "^3.3.3",
     "tsx": "^4.19.1",

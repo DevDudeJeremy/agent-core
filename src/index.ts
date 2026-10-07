@@ -9,12 +9,14 @@
 // Config & agent definition
 export {
   defineAgent,
+  defineAgentFromEnv,
   fromEnv,
   VERSION,
   PROTOCOL_VERSION,
   DEFAULT_MODEL,
   DEFAULTS,
   type AgentConfig,
+  type AgentFile,
   type ResolvedAgentConfig,
   type AgentRuntime,
 } from './config.js';
@@ -94,7 +96,11 @@ export type {
   RetrievedChunk,
 } from './stores/types.js';
 export { createMemoryStores } from './stores/memory.js';
-export { createSupabaseStores } from './stores/supabase.js';
+export {
+  createSupabaseStores,
+  DEFAULT_STORE_TIMEOUT_MS,
+  type SupabaseStoreOptions,
+} from './stores/supabase.js';
 
 // Tools
 export {

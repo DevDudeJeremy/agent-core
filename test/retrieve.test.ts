@@ -122,8 +122,8 @@ describe('RRF constants are pinned (SPEC §9.16)', () => {
   });
 
   it('the SQL function ddj_match_chunks hard-codes the same two numbers', () => {
-    // Read as text. Nothing here executes the migration, so this pins what the file says,
-    // not what Postgres does with it.
+    // Read as text, so this pins what the file says. test/postgres.test.ts is where the
+    // migration is executed and the two cuts and the fusion are checked on real Postgres.
     const dir = new URL('../supabase/migrations/', import.meta.url);
     const sql = readdirSync(dir)
       .filter((f) => f.endsWith('.sql'))

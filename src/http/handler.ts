@@ -1,8 +1,9 @@
 /**
  * createAgentHandler(): the entire HTTP surface as one `(Request) => Promise<Response>`.
  * Routing, CORS, rate limiting, body validation, SSE orchestration, and error JSON all
- * conform to docs/http-contract.md. No server, no platform binding — a thin adapter mounts
- * this on Node/Workers/Vercel/Deno/Bun.
+ * conform to docs/http-contract.md. No server, no platform binding — it is meant to mount
+ * on Node/Workers/Vercel/Deno/Bun behind a thin adapter. Only the Node adapter
+ * (examples/node-server.ts) is written and has been run.
  */
 import { z } from 'zod';
 import type { ResolvedAgentConfig } from '../config.js';
@@ -57,7 +58,8 @@ export function createAgentHandler(
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // GET {base}/health — no auth, no env, no CORS restriction.
+    // GET {base}/health — no auth, no env, no CORS restriction: it is public and carries no
+    // secret, so any page may read it, whatever the chat allowlist says.
     if (path === `${base}/health`) {
       if (req.method !== 'GET') {
         return errorJson(405, 'method_not_allowed', 'Use GET for the health endpoint.', origin);
@@ -68,7 +70,10 @@ export function createAgentHandler(
           version: agent.version,
           protocolVersion: agent.protocolVersion,
         }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
+        },
       );
     }
 

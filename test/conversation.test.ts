@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { MockModelClient, textDelta, toolUse, stop } from '../src/testing/mock-model.js';
 import { captureLead, FeatureHashEmbeddings } from '../src/index.js';
+import type { AgentEvent, ConversationStore, EventSink } from '../src/index.js';
 import { buildAgent, collectTurn } from './harness.js';
 
 describe('conversation loop (SPEC §9.4)', () => {
@@ -131,6 +132,155 @@ describe('conversation loop (SPEC §9.4)', () => {
     const sent = model.calls[0]!.messages;
     expect(sent[0]!.role).toBe('user');
     expect(sent.map((m) => m.content)).toEqual(['m20', 'm21', 'm22', 'm23', 'newest']);
+  });
+});
+
+describe('a tool the agent was not given (SPEC §9.23)', () => {
+  it('is never run: nothing executes, the model is told, and the loop carries on', async () => {
+    // The agent has exactly one tool. The model asks for a different one.
+    const runSpy = vi.spyOn(captureLead, 'run');
+    const model = new MockModelClient([
+      [toolUse('t1', 'issue_refund', { amount: 500, to: 'ada@x.com' }), stop('tool_use')],
+      [textDelta('I cannot do that here.'), stop('end_turn')],
+    ]);
+    const { agent, sink, hookEvents } = buildAgent(model, { tools: [captureLead] });
+
+    const frames = await collectTurn(agent, 'refund me 500');
+    runSpy.mockRestore();
+
+    // The decision first: nothing ran and nothing was recorded as done, queued or escalated.
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(sink.events.map((e) => e.type)).toEqual([
+      'conversation_started',
+      'user_message',
+      'model_call',
+      'model_call',
+      'assistant_message',
+    ]);
+    expect(hookEvents.map((e) => e.type)).toEqual(sink.events.map((e) => e.type));
+
+    // The model is told, in the message the next request opens its tool results with.
+    expect(model.calls).toHaveLength(2);
+    expect(model.calls[1]!.messages.at(-1)).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 't1',
+          content: 'Unknown tool: issue_refund',
+          is_error: true,
+        },
+      ],
+    });
+
+    // The wire says the call failed, carries no input, and the turn still ends cleanly.
+    expect(frames.filter((f) => f.event === 'tool').map((f) => f.data)).toEqual([
+      { name: 'issue_refund', status: 'failed' },
+    ]);
+    expect(JSON.stringify(frames)).not.toContain('ada@x.com');
+    expect(frames.map((f) => f.event)).toEqual(['meta', 'tool', 'text', 'done']);
+    expect(frames.at(-1)).toEqual({ event: 'done', data: { finishReason: 'end_turn' } });
+  });
+
+  it('a known tool in the same turn still runs, and each call gets its own answer', async () => {
+    const model = new MockModelClient([
+      [
+        toolUse('t1', 'issue_refund', { amount: 500 }),
+        toolUse('t2', 'capture_lead', { email: 'ada@x.com' }),
+        stop('tool_use'),
+      ],
+      [textDelta('Noted.'), stop('end_turn')],
+    ]);
+    const { agent, sink } = buildAgent(model, { tools: [captureLead] });
+
+    await collectTurn(agent, 'refund me, and email me at ada@x.com');
+
+    expect(sink.events.filter((e) => e.type === 'lead_captured')).toHaveLength(1);
+    const results = model.calls[1]!.messages.at(-1)!.content as Array<{
+      tool_use_id: string;
+      is_error?: boolean;
+    }>;
+    expect(results.map((r) => [r.tool_use_id, r.is_error])).toEqual([
+      ['t1', true],
+      ['t2', false],
+    ]);
+  });
+});
+
+describe('error events (SPEC §9.27)', () => {
+  const down = async (): Promise<never> => {
+    throw new Error('store down');
+  };
+  const deadStore: ConversationStore = {
+    create: down,
+    get: down,
+    appendMessage: down,
+    listMessages: down,
+    setStatus: down,
+  };
+
+  it('a failure before a conversation exists is logged with no conversation id, and the hook hears it', async () => {
+    const { agent, sink, hookEvents } = buildAgent(new MockModelClient([]));
+    const broken = { ...agent, runtime: { ...agent.runtime, conversations: deadStore } };
+
+    const frames = await collectTurn(broken, 'hi');
+
+    expect(frames.map((f) => f.event)).toEqual(['error']);
+    expect(sink.events).toHaveLength(1);
+    // '' is what the Supabase sink turns into NULL; a made-up id would not fit a uuid column.
+    expect(sink.events[0]).toMatchObject({
+      type: 'error',
+      conversationId: '',
+      payload: { message: 'store down' },
+    });
+    expect(hookEvents).toEqual(sink.events);
+  });
+
+  it('the hook is told even when the sink is the thing that is down', async () => {
+    const { agent, hookEvents } = buildAgent(new MockModelClient([[stop('end_turn')]]));
+    const deadSink: EventSink = {
+      write: async () => {
+        throw new Error('sink down');
+      },
+    };
+    const broken = { ...agent, runtime: { ...agent.runtime, events: deadSink } };
+
+    const frames = await collectTurn(broken, 'hi');
+    const cid = (frames[0]!.data as { conversationId: string }).conversationId;
+
+    // The first event of the turn could not be written, so the turn failed...
+    expect(frames.map((f) => f.event)).toEqual(['meta', 'error']);
+    // ...and the hook got exactly one event: the failure, with the conversation it belongs to.
+    expect(hookEvents).toHaveLength(1);
+    expect(hookEvents[0]).toMatchObject({
+      type: 'error',
+      conversationId: cid,
+      payload: { message: 'sink down' },
+    });
+  });
+
+  it('a hook that throws on the error does not cost the visitor the error frame', async () => {
+    const { agent, sink } = buildAgent(new MockModelClient([]));
+    const seen: AgentEvent[] = [];
+    const broken = {
+      ...agent,
+      runtime: { ...agent.runtime, conversations: deadStore },
+      onEvent: (e: AgentEvent) => {
+        seen.push(e);
+        throw new Error('hook down');
+      },
+    };
+
+    const frames = await collectTurn(broken, 'hi');
+
+    expect(seen.map((e) => e.type)).toEqual(['error']);
+    expect(sink.events.map((e) => e.type)).toEqual(['error']);
+    expect(frames).toEqual([
+      {
+        event: 'error',
+        data: { code: 'server_error', message: 'Something went wrong handling this message.' },
+      },
+    ]);
   });
 });
 

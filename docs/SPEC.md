@@ -1,6 +1,6 @@
 # agent-core — design spec
 
-**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12)
+**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14)
 
 The design spec this package was built and reviewed against. `SPEC §n` in source comments
 and test names points at a section of this file. Edited for publication: references to
@@ -34,9 +34,10 @@ zod-defined gated tools, SSE streaming, and dependency-injected stores so every 
 is testable in memory.**
 
 - **Fetch-standard handler, not a server.** `createAgentHandler(agent)` returns
-  `(req: Request) => Promise<Response>`. That one signature runs on Node ≥22, Cloudflare
-  Workers, Vercel, Netlify, Deno, and Bun with only a thin adapter — the client owns their
-  hosting, so the core cannot weld itself to a platform.
+  `(req: Request) => Promise<Response>`. That one signature is meant to mount on Node ≥22,
+  Cloudflare Workers, Vercel, Netlify, Deno, and Bun with only a thin adapter — the client
+  owns their hosting, so the core cannot weld itself to a platform. Only the Node adapter
+  is written and has been run; the others are untried (corrected 2026-10-07, §13).
   *Alternative rejected:* Express/Fastify app — binds us to Node servers, adds deps, and
   every serverless deploy becomes a shim.
 - **Anthropic Messages API via `@anthropic-ai/sdk`, behind a `ModelClient` interface.**
@@ -77,8 +78,8 @@ is testable in memory.**
 | Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.1.0` |
 | Language | TypeScript `^5`, `strict: true`, build = `tsc` to `dist/`, `check` = `tsc --noEmit` |
 | Node | `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` in `engines` — the range vitest 5 declares — and `.nvmrc` = `22` (§12) |
-| Runtime deps | Exactly three: `@anthropic-ai/sdk`, `@supabase/supabase-js`, `zod` (v4 — use built-in `z.toJSONSchema()`) |
-| Dev deps | `typescript`, `vitest` (`^5`), `vite` (vitest 5's required peer, declared directly so npm keeps its native bindings — §12), `tsx`, `prettier`, `@types/node` |
+| Runtime deps | Exactly three: `@anthropic-ai/sdk`, `@supabase/supabase-js` (`^2.112.0`: the first release with both `db.retry` and `db.timeout`, which the store sets — §14), `zod` (v4 — use built-in `z.toJSONSchema()`) |
+| Dev deps | `typescript`, `vitest` (`^5`), `vite` (vitest 5's required peer, declared directly so npm keeps its native bindings — §12), `tsx`, `prettier`, `@types/node`, and — for one test file only — `@electric-sql/pglite` `0.5.8` with `@electric-sql/pglite-pgvector` `0.0.9` (Postgres and pgvector compiled to WebAssembly, so the migration runs in-process with no server; pinned exactly because the second peers on the first — §13) |
 | Test runner | Vitest; global-fetch kill switch in test setup (any real network attempt throws) |
 | HTTP surface | Web-standard `Request`/`Response`; SSE streaming; base path default `/agent` |
 | API contract | [`http-contract.md`](http-contract.md) is canonical; `protocolVersion: 1` |
@@ -202,6 +203,21 @@ interface AgentConfig {
 (`ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`) —
 throws a clear error naming the missing var **only when called**, never at import.
 
+**The config file (added 2026-10-07, §13).** A per-client config *file* default-exports
+everything above with `runtime` optional and partial
+(`Omit<AgentConfig, 'runtime'> & { runtime?: Partial<AgentRuntime> }`), so it loads with no
+keys. Whatever mounts the agent supplies the parts the file leaves out: `fromEnv()` on a
+deployment host, or the offline stand-ins in `examples/offline-runtime.ts`. A part the file
+does supply — its own `ModelClient`, say — is the one used. `AgentConfig` itself is
+unchanged.
+
+**The production path (added 2026-10-07, §14).** That file shape is exported from the core
+as `AgentFile`, and `defineAgentFromEnv(file)` is the one call that turns it into a
+production agent: it builds the runtime with `fromEnv()` and applies the two settings a
+host may override. `AGENT_MODEL`, when set, wins over the file's `model`. A non-empty
+`AGENT_ALLOWED_ORIGINS` replaces the file's `http.allowedOrigins`; unset, the file's list
+stands. `fromEnv()` still returns the three pieces for anyone assembling by hand.
+
 ### 4.5 Observability (every action visible)
 
 `AgentEvent` = `{ type, conversationId, at: ISO string, payload }` with types:
@@ -215,6 +231,9 @@ is no default sink — the runtime names one: `fromEnv()` supplies the Supabase 
 in `agent_events`), the offline demo uses `ConsoleEventSink` (one JSON line per event to
 stdout), and tests use `MemoryEventSink` (corrected 2026-10-07, §12). Raw tool inputs
 appear in server-side events only — SSE `tool` frames carry name + status, never inputs.
+An `error` raised before a conversation is loaded or created has `conversationId: ''`,
+which the Supabase sink stores as NULL; it goes to the sink and to `onEvent` separately,
+so the hook hears of it even when the sink is the thing that is down (2026-10-07, §13).
 
 ### 4.6 Built-in tools (the three reference patterns)
 
@@ -270,7 +289,12 @@ agent-core/
 ├── .prettierignore                # prose is hand-wrapped; Prettier formats code + JSON
 ├── .env.example                   # all vars commented, no values (§6.2)
 ├── .gitignore                     # node_modules, dist, .env*  (not .env.example)
+├── .gitattributes                 # LF line endings on every checkout (§13)
 ├── .nvmrc                         # 22
+├── .github/
+│   └── workflows/
+│       └── ci.yml                 # the gate: install, check, test, build, format on three
+│                                  #   systems and two Node lines (§9.26)
 ├── supabase/
 │   └── migrations/
 │       └── 20260705000000_agent_core.sql   # §7 — file only, never applied from repo
@@ -278,7 +302,8 @@ agent-core/
 │   ├── index.ts                   # public exports: defineAgent, fromEnv, createAgentHandler,
 │   │                              #   ingestDocuments, retrieve, EMBEDDING_DIM, built-in tools,
 │   │                              #   memory stores, supabase store factory, all interfaces/types
-│   ├── config.ts                  # AgentConfig zod schema, defaults, defineAgent(), fromEnv()
+│   ├── config.ts                  # AgentConfig zod schema, defaults, defineAgent(), fromEnv(),
+│   │                              #   defineAgentFromEnv() and the AgentFile shape (§14)
 │   ├── engine/
 │   │   ├── conversation.ts        # runTurn(): the loop in §4.1 (steps 2–6)
 │   │   ├── events.ts              # AgentEvent types, EventSink, ConsoleEventSink
@@ -318,12 +343,20 @@ agent-core/
 │       └── mock-model.ts          # MockModelClient: constructed with scripted turns
 │                                  #   (text deltas / tool_use / stop), exported via "./testing"
 ├── scripts/
-│   └── ingest.ts                  # CLI (tsx): --dir, --dry-run per §4.2
+│   ├── ingest.ts                  # CLI (tsx): --dir, --dry-run per §4.2; the entry point only
+│   ├── ingest-cli.ts              # the CLI's logic, importable so a test can run it (§14)
+│   └── read-docs.ts               # folder of .md/.txt → IngestDoc[] (shared with the examples)
 ├── examples/
 │   ├── node-server.ts             # node:http ⇄ fetch Request/Response adapter;
 │   │                              #   env present → fromEnv(); absent → LOUD "OFFLINE DEMO
-│   │                              #   MODE" banner + memory stores + MockModelClient
-│   └── client-agent.example.ts    # filled-in defineAgent() config — the derivation exemplar
+│   │                              #   MODE" banner + memory stores + MockModelClient;
+│   │                              #   --config <file> [--content <dir>] serves that agent (§13)
+│   ├── load-agent.ts              # loads a config file and builds the offline agent from a
+│   │                              #   config plus a content folder; the no-config demo agent
+│   ├── offline-runtime.ts         # the stand-ins for the paid services, including a
+│   │                              #   "model" that only quotes the retrieved passage
+│   ├── client-agent.example.ts    # the config exemplar: everything but the runtime
+│   └── client-content.example/    # three short .md files for that exemplar
 └── test/
     ├── setup.ts                   # replaces globalThis.fetch with a thrower (network kill switch)
     ├── harness.ts                 # shared helpers: offline agent, frame collector, SSE parser
@@ -339,7 +372,17 @@ agent-core/
     │                              #   error, error-only stream when no conversation exists
     ├── supabase-store.test.ts     # write order of upsertDocument against a recording fetch
     │                              #   stub (§9.19); no network, kill switch restored after
-    └── lockfile.test.ts           # the committed lockfile survives a plain npm install (§9.18)
+    ├── anthropic-client.test.ts   # AnthropicModelClient through the real SDK, against a
+    │                              #   replay of the documented stream (§9.20, §9.21)
+    ├── postgres.test.ts           # the migration and ddj_match_chunks on real Postgres with
+    │                              #   pgvector, in-process (§9.22)
+    ├── new-agent.test.ts          # a config file plus a content folder → a grounded answer,
+    │                              #   with no edit under src/ (§9.24); what the offline log
+    │                              #   names (§9.30)
+    ├── from-env.test.ts           # defineAgentFromEnv and the host's overrides (§9.32); the
+    │                              #   store deadline through fromEnv and the ingest CLI (§9.34)
+    └── lockfile.test.ts           # the committed lockfile survives a plain npm install
+                                   #   (§9.18) and installs from the registry alone (§9.25)
 ```
 
 ### 6.1 README.md contents
@@ -385,14 +428,19 @@ embedding dimension 1024 must match `EMBEDDING_DIM` in `src/rag/embed.ts`. Table
   **RRF with k = 60**, returns chunk id, content, source_id, title, url, rrf_score,
   limit `match_count`.
 
-No npm script, source file, or test executes any DDL. `createSupabaseStores` assumes the
-schema exists.
+No npm script or source file executes any DDL, and nothing applies it to a live database.
+`createSupabaseStores` assumes the schema exists. One test (`test/postgres.test.ts`, §9.22)
+applies the file to a throwaway Postgres that lives inside the test process (amended
+2026-10-07, §13).
 
 ## 8. Deriving a client agent
 
 Documented in README. Copy the package (without `docs/`, `node_modules` and `dist`) into
 the client's project, then: (1) copy `examples/client-agent.example.ts` →
-`agent.config.ts` and fill in business/persona/tools/origins; (2) `cp .env.example .env`
+`agent.config.ts` and fill in business/persona/tools/origins — the file exports everything
+but the runtime (§4.4), and
+`npx tsx examples/node-server.ts --config agent.config.ts --content <folder>` serves it
+offline before any key exists (§13); (2) `cp .env.example .env`
 on the **deployment host** (client secrets never live in this repo); (3) apply the
 migration to the client's Supabase project; (4) drop the client's content into a
 `knowledge/` folder and run the ingest CLI; (5) deploy behind their platform's adapter;
@@ -460,14 +508,18 @@ All commands from the copy's root.
     tables, both indexes, RLS enabled on every table, zero `create policy` statements,
     and `ddj_match_chunks`; `grep -rn "20260705000000\|ddj_match_chunks" src/ scripts/
     package.json` shows no code path that *executes* the file (the RPC name appearing in
-    `stores/supabase.ts` as a call target is expected).
+    `stores/supabase.ts` as a call target is expected). The one place the file is
+    executed is `test/postgres.test.ts`, against an in-process Postgres (§9.22).
 12. **Secrets hygiene:** `.env.example` lists exactly the §6.2 vars, all commented, no
     values; no string resembling a real key anywhere; `process.env` reads occur only
     inside `fromEnv()`/`createSupabaseStores` bodies.
 13. **Offline demo:** `npx tsx examples/node-server.ts` with no env starts, prints the
     OFFLINE DEMO MODE banner, and a `curl -N` POST to `/agent/chat` returns a complete
     valid SSE conversation (meta → text → done). `scripts/ingest.ts --dry-run` against a
-    sample dir prints chunk stats with zero env and zero network.
+    sample dir prints chunk stats with zero env and zero network. Added 2026-10-07 (§13):
+    with `--config examples/client-agent.example.ts --content
+    examples/client-content.example` and no env, the same server answers a question that
+    content covers by quoting the passage and naming its source file.
 14. **Docs:** README contains the §6.1 items including the derivation checklist (§8) and
     the never-apply-migrations-from-this-repo warning; `examples/client-agent.example.ts`
     typechecks and demonstrates every commonly-set config field.
@@ -479,10 +531,11 @@ All commands from the copy's root.
     validation, leave the status `open` and send no `handoff` frame.
 16. **RRF constants pinned** (added 2026-10-07, §11): the suite asserts the literals —
     `RRF_K` is 60 and `RRF_CANDIDATES` is 12 — shows the memory store applying both (a
-    rank-1 single-channel score of 1/61; each channel cut at 12, shown on two disjoint
-    sets of 13), and asserts that the migrations define `ddj_match_chunks` exactly once
+    rank-1 single-channel score of 1/61; each channel cut at 12, shown on twelve
+    vector-only chunks, one chunk in both channels and thirteen keyword-only chunks), and
+    asserts that the migrations define `ddj_match_chunks` exactly once
     and with the same two numbers. The SQL is read as text and never executed, so this
-    pins what the file says, not what Postgres does with it. Changing either number in
+    pins what the file says; §9.22 is where Postgres runs it. Changing either number in
     either place fails the suite.
 17. **Formatting** (added 2026-10-07, §11): `npm run format:check` exits 0 on a fresh
     copy, so `npm run format` rewrites nothing.
@@ -499,6 +552,94 @@ All commands from the copy's root.
     `appendMessage` throw. Checked offline against a recording `fetch` stub: that proves
     the order and bodies of the requests supabase-js sends, not that Postgres accepts
     them.
+20. **The real model client** (added 2026-10-07, §13): `AnthropicModelClient` runs through
+    the real `@anthropic-ai/sdk` with `fetch` replaced by a recording stub that replays the
+    Messages streaming format as Anthropic documents it (`message_start`, `ping`,
+    `content_block_start` / `_delta` / `_stop` with `text_delta` and a `tool_use` block
+    whose input arrives as several `input_json_delta` fragments, `message_delta`,
+    `message_stop`). Text deltas pass through in order; the tool call is reassembled; every
+    documented stop reason maps; an `error` event in the stream ends the turn with an SSE
+    `error` frame. A two-request tool round trip through `runTurn` completes, and the
+    second request the SDK sends carries the assistant's `tool_use` block followed by one
+    user message holding the `tool_result` (`tool_use_id`, `content`, `is_error`). The
+    request is a POST to `/v1/messages` with `x-api-key`, `anthropic-version` and
+    `stream: true`. This proves the client against the documented format, not against the
+    live service.
+21. **It streams** (added 2026-10-07, §13): through `createAgentHandler`, with a model that
+    waits on a promise between deltas, the reader of the HTTP response receives the first
+    `text` frame while the model has produced exactly one delta. The same holds for the
+    real client when the upstream response body is held open. No timers: a handler or
+    client that buffered would leave these tests unable to finish.
+22. **The SQL on real Postgres** (added 2026-10-07, §13): `test/postgres.test.ts` applies
+    every file in `supabase/migrations/` to an in-process Postgres with pgvector, twice,
+    with no error. Against it: a vector-only and a keyword-only match both surface; fused
+    scores equal the RRF values for hand-set ranks; each channel is cut at 12; a
+    multi-word query follows `websearch_to_tsquery` (all words, stemmed, stop words
+    dropped, quoted phrases, `or`, `-`); a role without `BYPASSRLS` that holds every table
+    grant reads no row from any `agent_` table, gets no row from `ddj_match_chunks`, and
+    cannot insert, while a `BYPASSRLS` role can; a wrong-dimension vector, a non-uuid
+    `conversation_id` and a message for a missing conversation are rejected, and a NULL
+    `conversation_id` on an event is accepted. The same fixtures run through the memory
+    store, and the test asserts where the two agree and each difference that was measured.
+23. **Unknown tool** (added 2026-10-07, §13): when the model asks for a tool the agent was
+    not given, no tool's `run()` is called, no `tool_executed`, `approval_required`,
+    `lead_captured` or `handoff_requested` event is written, the wire carries
+    `tool {status:"failed"}`, the model's next request carries an `is_error` `tool_result`
+    naming the tool, and the turn ends with `done`.
+24. **A new agent is a config file plus content** (added 2026-10-07, §13): a test writes a
+    config file and a folder of content that have never existed, loads them with the same
+    function `examples/node-server.ts` uses, and through `createAgentHandler` gets an
+    answer that quotes a sentence found only in that folder and names its source file. The
+    model request carries that config's business, persona and extra rule, and the config's
+    `basePath` is the one that answers. The shipped exemplar, loaded the same way beside
+    it, answers from its own folder and cannot see the new one's content. A config that
+    supplies its own `ModelClient` gets that model and the runner's stores. The test writes
+    nothing under `src/`.
+25. **Install surface** (added 2026-10-07, §13): every lockfile entry resolves to
+    `registry.npmjs.org` with an integrity hash; the packages flagged as having an install
+    script are exactly `esbuild` and `fsevents`; nothing is recorded as peer-only. What
+    those scripts do is recorded in §13.
+26. **The gate** (added 2026-10-07, §13; Node 26 added in §14): `.github/workflows/ci.yml`
+    runs on every push and pull request, on Ubuntu, macOS and Windows with Node 22, 24 and
+    26: `npm ci`,
+    `npm run check`, `npm test`, `npm run build`, `npm run format:check`; and a second job
+    runs a plain `npm install` and fails if `package-lock.json` changed. It runs only where
+    this package is a repository root.
+27. **Error events** (added 2026-10-07, §13): a turn that fails before a conversation
+    exists writes one `error` event with `conversationId: ''` to the sink and to
+    `onEvent`; the Supabase sink sends it as `conversation_id: null`. When the sink's
+    `write` throws, `onEvent` still receives the `error` event and the wire still ends
+    with an `error` frame.
+28. **Health is readable from any origin** (added 2026-10-07, §13): `GET {base}/health`
+    answers with `Access-Control-Allow-Origin: *`, whatever the allowlist and whatever
+    `Origin` the request carries. `POST {base}/chat` keeps the allowlist.
+29. **A dead store fails fast** (added 2026-10-07, §13): the Supabase client is built with
+    retries off and a per-request deadline (2 seconds by default; `fromEnv()` and
+    `createSupabaseStores` accept another, and the ingest CLI asks for 60). Against the
+    recording stub: a read whose connection is refused is attempted once and rejects; a
+    request that never answers is abandoned at the deadline and not before. Checked with
+    the test runner's clock, so no test waits in real time.
+30. **The offline log names what answered** (added 2026-10-07, §14): when an offline
+    stand-in is answering, the `model_call` event names that stand-in and no event names a
+    Claude model. A config that brings its own `ModelClient` keeps the model it names. An
+    agent built by `defineAgentFromEnv` logs the configured model, as before.
+31. **The store's dependency floor** (added 2026-10-07, §14): `package.json` declares
+    `@supabase/supabase-js` at `^2.112.0` or higher, the lockfile resolves 2.117.3, and
+    §9.18 holds after the lockfile is rebuilt.
+32. **The production path applies the host's overrides** (added 2026-10-07, §14):
+    `defineAgentFromEnv(file)` with `AGENT_MODEL` and `AGENT_ALLOWED_ORIGINS` set resolves
+    to that model and that allowlist; with neither set, to the file's; with no allowlist in
+    either, a browser origin is refused on `chat`. A runtime part the file supplies is
+    kept. A missing required variable throws an error that names it. `storeTimeoutMs`
+    reaches the store: a request that never answers is abandoned at that deadline.
+33. **The keyword half on a full sentence** (added 2026-10-07, §14): with the shipped
+    example content on real Postgres, "Do you fix water heaters?" matches no chunk by
+    keyword and "water heaters" matches one, and for the full question the function still
+    returns the water-heater passage first, through the vector half. The README says so
+    where it describes retrieval and again in its operating notes. The query shape is
+    unchanged.
+34. **The ingest CLI's deadline** (added 2026-10-07, §14): a real (non-dry-run) ingest
+    whose store never answers is abandoned at 60 seconds, not at the chat default of 2.
 
 ## 10. Out of scope (deliberate)
 
@@ -507,8 +648,9 @@ analytics dashboards; approval-resolution UI/flow
 (the event record is the deliverable); web crawling/HTML ingestion (per-client
 preprocessing feeds files to the CLI); PII redaction/retention policies (per-client,
 noted in README ops section); multi-tenant serving (one deploy per client — client owns
-infra); prompt caching tuning, CI workflows, deployment configs; real Cal.com/Stripe/CRM
-tool wiring (per-client work on top of the tool interface). Keep it lean.
+infra); prompt caching tuning, deployment configs; real Cal.com/Stripe/CRM
+tool wiring (per-client work on top of the tool interface). Keep it lean. (A CI workflow
+was on this list until 2026-10-07; §13 adds one.)
 
 ## 11. Amendment — 2026-10-07
 
@@ -600,3 +742,183 @@ normalised, `src/` differs from the pre-§12 build in exactly two files:
    proxy the deployment must supply `http.clientKey` (README, "Operating it").
 
 Every new or changed test was shown to fail on a deliberate break of what it guards.
+
+## 13. Amendment — 2026-10-07, the opening claims
+
+The README opens with five paragraphs of claims. After publication each one was checked
+against what had actually been executed, and several had never been run by anything. This
+amendment closes them. The rule for it: where the package fell short of the words, the
+package changed, not the words.
+
+**This one changes `src/` in five files:** `engine/conversation.ts` (item 7),
+`http/handler.ts` (item 9), `stores/supabase.ts` with `config.ts` (item 10), and
+`index.ts`, which exports the new deadline constant. Every other `src/` edit is a comment.
+Compiled with comments stripped, `src/` differs from the pre-§13 build in exactly those
+five files.
+
+1. **The real model client runs under test** (§9.20, §9.21;
+   `test/anthropic-client.test.ts`). Until now every test used `MockModelClient`, so
+   `AnthropicModelClient` and the SDK beneath it had never run. The test swaps `fetch` for
+   a recording stub, as `test/supabase-store.test.ts` does, and puts the kill switch back.
+   The replayed stream is written out from Anthropic's published streaming reference
+   (`platform.claude.com/docs/en/build-with-claude/streaming`, read 2026-10-07); it is not
+   a recording of a live call, and the test says so. The SDK reads `ANTHROPIC_BASE_URL`
+   and `ANTHROPIC_AUTH_TOKEN` from the environment by itself when a client is built, so
+   the test clears both; that read happens inside `fromEnv()`'s call, never at import, and
+   the README's variable table now names it.
+2. **The SQL runs under test** (§9.22; `test/postgres.test.ts`). Two devDependencies:
+   `@electric-sql/pglite` `0.5.8` (PostgreSQL 18.3 compiled to WebAssembly) and
+   `@electric-sql/pglite-pgvector` `0.0.9` (pgvector 0.8.1 for it). Both are Apache-2.0,
+   have no dependencies and no install script, and load from `node_modules` with no
+   network. *Alternatives rejected:* a Postgres container (needs Docker and a pulled
+   image, so the suite would no longer run from `npm ci` alone); the Supabase CLI (not a
+   dependency a reader has, and it starts containers too). What this is not: Supabase.
+   There is no PostgREST in the test, the roles are created by the test to stand for
+   Supabase's `anon`, `authenticated` and `service_role`, and the Postgres version is
+   PGlite's. The memory store is left as it is; the test records where it differs.
+3. **Unknown tool** (§9.23; `test/conversation.test.ts`). The branch existed with no test.
+4. **A config file a runner can load** (§9.24). The exemplar called `fromEnv()` as it was
+   imported, so it could not load without keys; the Node example hard-coded its own agent;
+   the offline demo ran with retrieval off. Nothing showed a second agent standing up
+   without an edit to code. Now:
+   - `examples/client-agent.example.ts` default-exports the config without a runtime. A
+     config file may still supply any part of the runtime (§4.4): that is how a config
+     brings its own `ModelClient`.
+   - `examples/load-agent.ts` loads such a file, applies the two environment overrides
+     (`AGENT_MODEL`, `AGENT_ALLOWED_ORIGINS`), and builds an offline agent from a config
+     plus a content folder. (§14 moves the overrides into the core, as
+     `defineAgentFromEnv`.)
+   - `examples/offline-runtime.ts` holds the stand-ins: memory stores, the word-hashing
+     embedder, and a stand-in "model" that replies with the best-matching retrieved
+     passage and nothing else. It generates no language. It is there so a reader can watch
+     a business's own content come back with no key, and the demo banner says what it is.
+     The demo server paces the stand-ins' replies (a short wait between deltas, `--pace 0`
+     to turn it off), so the frames can be seen arriving one at a time; tests use no pace.
+   - `examples/node-server.ts` takes `--config <file>` and `--content <dir>`. With no
+     flags it behaves exactly as before.
+   - `scripts/read-docs.ts` is the folder reader, moved out of `scripts/ingest.ts` so the
+     CLI and the examples share one. A document's source id is now its path with forward
+     slashes on every system; on Windows it used to carry backslashes, which would have
+     given the same file two ids across machines. Nothing changes on macOS or Linux.
+   - `examples/client-content.example/` is three short documents for the exemplar.
+
+   No file under `src/` changes for this item, and `AgentConfig` is as it was.
+   *Alternatives rejected:* a config that builds its own runtime (every config would carry
+   plumbing, and none could load offline); a JSON config (it cannot hold tools, a
+   reranker or the `onEvent` hook); a loader inside `src/` (reading files is Node-only,
+   and the core has to stay portable).
+5. **Install surface** (§9.25; `test/lockfile.test.ts`). Two locked packages are flagged
+   as having an install script. `esbuild` runs `node install.js` after install: it finds
+   the platform binary npm already fetched as an optional dependency and runs it once to
+   check the version. Only when that optional package is missing does it fetch anything,
+   and then from `registry.npmjs.org`. `fsevents` (macOS only) carries the flag in the
+   registry's metadata, but its tarball has a prebuilt binary, no install script and no
+   `binding.gyp`, so nothing runs. The two Postgres packages add no script.
+6. **A gate** (§9.26; `.github/workflows/ci.yml`, `.gitattributes`). `.gitattributes`
+   forces LF, because a Windows checkout that rewrote line endings would fail the format
+   check on every file.
+7. **Error events** (§9.27; `src/engine/conversation.ts`). An error raised before a
+   conversation existed was logged with the conversation id `'unknown'`. The events
+   table's column is a `uuid`, so Postgres rejects that row (now executed, in §9.22), the
+   sink threw, and because the sink is written before the hook, `onEvent` never heard of
+   it. The id is now `''`, which the Supabase sink already stored as NULL, and the error
+   path tells the sink and the hook separately. Ordinary events are unchanged: if the
+   sink fails on one, the turn fails, and the hook is told of that failure.
+8. **Smaller corrections.** §9.16 describes the fixture as it now is. §2 and
+   `src/http/handler.ts` no longer say the handler "runs on" platforms nobody has tried.
+   The Supabase stub answers a hash lookup with an array, as PostgREST does for a request
+   that does not ask for a single object.
+9. **Health is readable from any origin** (§9.28; `src/http/handler.ts`). Found in a real
+   browser after publication: the endpoint's own comment said "no CORS restriction", but
+   the response carried no `Access-Control-Allow-Origin`, so a page on another origin
+   could call it and not read it. It is public and carries no secret, so it now answers
+   `*`. [`http-contract.md`](http-contract.md) says so.
+10. **A dead store fails fast** (§9.29; `src/stores/supabase.ts`, `src/config.ts`).
+    Measured after publication: `getDocumentHash` against a closed port took 7.0 seconds
+    to fail. supabase-js 2.117 retries reads three times with 1, 2 and 4 seconds between
+    attempts, and sets no deadline of its own. The client is now built with
+    `db.retry: false` and `db.timeout`. Two seconds suits a visitor waiting on a chat
+    reply; it is too short for a large document's chunks on a slow link, so the deadline
+    is a parameter and the ingest CLI passes 60 seconds. *Alternative rejected:* keeping
+    the retries and shortening them — the library offers on or off, nothing in between.
+    The Anthropic SDK's own retries (two, with backoff) are untouched.
+
+**Lockfile.** Deleted with `node_modules` and rebuilt with the §11 pin
+(`npm install --before=2026-10-07T14:00:00Z`). The two new packages are the only
+additions: 109 packages became 111.
+
+**How it was checked.** §9.1 on fresh copies with `npm install` and with `npm ci`, on two
+npm versions, lockfile byte-identical after each; §9.20–§9.29; the suite green with the
+operating system denying all network access and with no environment variables. Every new
+or changed test was shown to fail on a deliberate break of what it guards: 105 breaks,
+one at a time, in a scratch copy, 105 red. The workflow is the exception. It can only run
+on GitHub, so it was written and parsed but not run before its first push.
+
+**Not in this change.** One live call each to Anthropic and Voyage; making the memory
+store rank the way Postgres does; an event for an unknown-tool request (none is written
+today); branch protection, without which the workflow reports on a change but does not
+block it.
+
+## 14. Amendment — 2026-10-07, review fixes
+
+The §13 change set was reviewed independently before it was published. The review passed
+it with four things to fix and four smaller notes. Each of the four was a place where the
+package said or did something not quite true.
+
+**This one adds to `src/` in two files:** `config.ts` (one function and one type, item 3)
+and `index.ts` (their exports). No existing behaviour in `src/` changes. Compiled with
+comments stripped, `src/` differs from the pre-§14 build in `config.js` and `index.js`.
+
+1. **The offline log names what answered** (§9.30; `examples/`). The offline server
+   printed `model_call {"model":"claude-haiku-4-5"}` two lines under a banner saying no
+   language model is called: the event carries the configured model id, and offline that
+   id was never used. In the offline path the agent's model is now the stand-in's own
+   name (`offline-passage-quoting-stand-in`, or `offline-scripted-stand-in` for the
+   no-flags demo). The built-in demo agent moves out of `examples/node-server.ts` into
+   `examples/load-agent.ts`, where a test can build it. Nothing a real deployment logs
+   changes.
+2. **The store's dependency floor** (§9.31; `package.json`, lockfile). The declared range
+   was `^2.45.4`, but the store sets `db.retry` and `db.timeout`, and supabase-js accepts
+   an option it does not know without a word. From the published packages: `db.timeout`
+   is typed and passed through in 2.110.9 and 2.111.0; `db.retry` is absent from both and
+   present, typed, passed through and honoured, in 2.112.0. The floor is `^2.112.0`. The
+   lockfile was rebuilt with the §11 pin: one line differs, and 2.117.3 is still what
+   resolves.
+3. **The production path applies the host's overrides** (§9.32; `src/config.ts`). The
+   README and the example config showed
+   `defineAgent({ ...config, runtime: fromEnv().runtime })`, which drops the `model` and
+   `allowedOrigins` that `fromEnv()` returns, while the variable table presented both as
+   in force. Only the Node example applied them. The overrides are now in the core as
+   `defineAgentFromEnv(file, options?)`, with the file shape exported as `AgentFile`; the
+   README, the example config and the Node example all use it. *Alternative rejected:*
+   rewording the table to say the variables only work in the Node example — the table was
+   the intent, and the snippet was the defect.
+4. **The keyword half on a full sentence** (§9.33). The whole message is the keyword
+   query, and `websearch_to_tsquery` needs every word, so an ordinary question usually
+   matches nothing by keyword and the vector half carries it. This was already asserted on
+   a fixture; it is now also asserted on the shipped example content and stated in the
+   README. **The query shape is not changed here.** Whether to change it (send key terms
+   only, or `or` the words) is a design decision that has not been made.
+5. **Two untested lines** (§9.32, §9.34). `fromEnv({ storeTimeoutMs })` and the ingest
+   CLI's 60 seconds get tests. To make the CLI's own call testable its logic moves to
+   `scripts/ingest-cli.ts` (`runIngest`), and `scripts/ingest.ts` becomes the entry point
+   that calls it. Its behaviour and output are unchanged.
+6. **The SDK's own environment reads.** With a key passed in, the installed SDK still
+   consults five variables: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+   `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG` and `ANTHROPIC_WEBHOOK_SIGNING_KEY`. The
+   README names all five; the test clears all five and pins the three that change a
+   request.
+7. **The workflow.** Node 26 joins the matrix: the package's `engines` admit it, and both
+   jobs pass by hand in a Node 26.10.0 Linux container. The header comment no longer
+   miscounts the quick start's commands.
+8. **An empty reply.** A tool call cut off by `maxTokens` is dropped, correctly, and the
+   turn then ends with nothing said. The behaviour stays; the README's operating notes
+   now say it and what to look for in the event log.
+
+**How it was checked.** As §13: fresh copies with `npm install` and with `npm ci` on two
+npm versions, lockfile byte-identical; the suite green with no environment and with all
+network denied; every new or changed test shown to fail on a deliberate break of what it
+guards (26 new breaks; 129 in all, 129 red).
+
+**Not in this change.** The shape of the keyword query (item 4); a spoken fallback for the
+empty reply (item 8).
