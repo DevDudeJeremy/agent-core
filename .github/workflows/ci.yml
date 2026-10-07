@@ -1,12 +1,14 @@
-# The gate. Every push and every pull request gets the four commands of the README's quick
-# start and the format check, on three operating systems and on Node 22, 24 and 26, plus a
-# check that a plain `npm install` leaves the lockfile alone.
+# The gate. Every pull request, and every push to main, gets the four commands of the
+# README's quick start and the format check, on three operating systems and on Node 22, 24
+# and 26, plus a check that a plain `npm install` leaves the lockfile alone.
 #
 # It needs no secrets: the suite runs with no API keys and no network beyond the install.
 name: CI
 
+# Not every push: a push to a branch with a pull request open would run each job twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:

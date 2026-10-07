@@ -31,7 +31,7 @@ Needs npm and Node 22 (22.12 or newer), Node 24, or Node 26 and later. `.nvmrc` 
 ```bash
 npm ci          # or npm install: both leave package-lock.json untouched
 npm run check   # tsc --noEmit over src, tests, examples and scripts
-npm test        # 116 tests, with fetch replaced by a function that throws
+npm test        # 125 tests, with fetch replaced by a function that throws
 npm run build   # tsc -> dist/
 ```
 
@@ -208,7 +208,7 @@ test name points at a section of it.
 
 ## How the tests work
 
-`npm test` runs 116 tests in thirteen files and needs no network — and that isn't on the
+`npm test` runs 125 tests in thirteen files and needs no network — and that isn't on the
 honour system. [`test/setup.ts`](test/setup.ts) replaces the global `fetch` with a
 function that throws, so a test that reached for a paid service through `fetch` would
 fail instead of going online. (Four files swap in a stub of their own for some tests,
@@ -240,9 +240,9 @@ What each file checks:
 | `test/prompt.test.ts` | The fixed guardrails always come first; business rules come after; the context block is marked untrusted and names its sources. |
 | `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`; the first `text` frame reaches the reader while the model is still mid-reply; `health` is readable from any origin while `chat` keeps the allowlist. |
 | `test/anthropic-client.test.ts` | `AnthropicModelClient` through the real SDK, against the documented stream: text deltas arrive in order; a tool call is put back together from its `input_json_delta` fragments; each stop reason maps; the request is the one the Messages API documents. Then the loop on top of it: a two-request tool round trip whose second request carries the `tool_result`; a tool call cut off by `max_tokens` is not run; an `error` event mid-stream and a refused key each end the turn with an `error` frame; and the first frame reaches the HTTP reader while the upstream response is still open. The SDK's own `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_CUSTOM_HEADERS` end up on the request, as the variables section says. |
-| `test/postgres.test.ts` | On real Postgres with pgvector: the migration applies as written, twice; a vector-only and a keyword-only match both surface with the RRF scores for hand-set ranks; each channel is cut at 12; a multi-word query follows `websearch_to_tsquery`; a role that may not bypass row-level security reads and writes nothing, and one that may does both; the constraints the stores lean on hold. The same fixtures run through the memory store, and each difference is asserted. On the shipped example content, a full-sentence question matches nothing by keyword and the vector half still puts the right passage first. |
+| `test/postgres.test.ts` | On real Postgres with pgvector: the migration applies as written, twice; a vector-only and a keyword-only match both surface with the RRF scores for hand-set ranks; each channel is cut at 12; a multi-word query follows `websearch_to_tsquery`; a message with no meaningful word in it matches nothing by keyword and raises nothing; a role that may not bypass row-level security reads and writes nothing, and one that may does both; the constraints the stores lean on hold. The same fixtures run through the memory store, and each difference is asserted. On the shipped example content, a full-sentence question matches nothing by keyword and the vector half still puts the right passage first. |
 | `test/new-agent.test.ts` | A config file and a content folder that the test writes become an agent that answers from that folder, as that business, on the path its config names; the shipped example stands up the same way beside it and neither sees the other's content; a config can bring its own model. Offline, the event log names the stand-in that answered, never a Claude model, and the no-config demo's reply is the one the quick start shows. |
-| `test/from-env.test.ts` | The production path, with made-up values in the environment: `defineAgentFromEnv` lets the host's `AGENT_MODEL` and `AGENT_ALLOWED_ORIGINS` win when they are set and the config's stand when they are not; with no allowlist anywhere a browser is refused; a runtime part the config supplies is kept; a missing variable is named. The store's deadline is the one asked for: through `fromEnv`, through `defineAgentFromEnv`, and in the ingest script, which gives it 60 seconds. A dry-run ingest needs no environment at all. |
+| `test/from-env.test.ts` | The production path, with made-up values in the environment: `defineAgentFromEnv` lets the host's `AGENT_MODEL` and `AGENT_ALLOWED_ORIGINS` win when they are set and the config's stand when they are not; a blank `AGENT_MODEL` counts as unset; with no allowlist anywhere a browser is refused; a runtime part the config supplies is the one used, whatever else has to be built, and a key is asked for only when the environment has to build its part; a missing variable is named. The store's deadline is the one asked for: through `fromEnv`, through `defineAgentFromEnv`, and in the ingest script, which gives it 60 seconds. A dry-run ingest needs no environment at all. |
 | `test/supabase-store.test.ts` | Against the recording stub: `upsertDocument` writes a `pending:` marker, replaces the chunks, then writes the real content hash; a failed chunk insert throws and the real hash is never written; ingest runs a document again while its stored hash is the marker; `appendMessage` throws when its `last_active_at` update fails; an event with no conversation is sent as NULL; a read that cannot connect is tried once, and a request that never answers is dropped at the deadline; the network kill switch is back afterwards. |
 | `test/lockfile.test.ts` | `vite` is a direct devDependency, nothing is recorded as peer-only in the lockfile, and the native binaries for macOS, Linux and Windows are listed. This is what keeps a plain `npm install` from stripping the lockfile. Every package comes from `registry.npmjs.org` with an integrity hash, and only `esbuild` and `fsevents` are flagged as running a script at install. The declared `@supabase/supabase-js` range starts at the first release that has the two options the store sets. |
 
@@ -302,6 +302,11 @@ Server-side only. Never expose them to the browser. Env is read only inside `fro
 when it is called, so importing the package with nothing set never throws.
 `defineAgentFromEnv(config)` calls it and applies the two overrides in this table; call
 `fromEnv()` yourself and it only hands them back.
+
+A key marked required is asked for only when the environment has to build that part of
+the runtime. A config that brings its own `modelClient` needs no `ANTHROPIC_API_KEY`, its
+own `embeddings` no `VOYAGE_API_KEY`, and all three stores neither Supabase variable.
+`fromEnv()` on its own needs all four.
 
 Five reads aren't this package's. Even with the key passed in, the Anthropic SDK looks at
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_LOG`

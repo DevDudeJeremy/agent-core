@@ -1,6 +1,6 @@
 # agent-core — design spec
 
-**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14)
+**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15)
 
 The design spec this package was built and reviewed against. `SPEC §n` in source comments
 and test names points at a section of this file. Edited for publication: references to
@@ -75,7 +75,7 @@ is testable in memory.**
 
 | Decision | Value |
 |---|---|
-| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.1.0` |
+| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.1.1` (was `0.1.0`; `fromEnv` gained an option, §15) |
 | Language | TypeScript `^5`, `strict: true`, build = `tsc` to `dist/`, `check` = `tsc --noEmit` |
 | Node | `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` in `engines` — the range vitest 5 declares — and `.nvmrc` = `22` (§12) |
 | Runtime deps | Exactly three: `@anthropic-ai/sdk`, `@supabase/supabase-js` (`^2.112.0`: the first release with both `db.retry` and `db.timeout`, which the store sets — §14), `zod` (v4 — use built-in `z.toJSONSchema()`) |
@@ -599,9 +599,9 @@ All commands from the copy's root.
     `registry.npmjs.org` with an integrity hash; the packages flagged as having an install
     script are exactly `esbuild` and `fsevents`; nothing is recorded as peer-only. What
     those scripts do is recorded in §13.
-26. **The gate** (added 2026-10-07, §13; Node 26 added in §14): `.github/workflows/ci.yml`
-    runs on every push and pull request, on Ubuntu, macOS and Windows with Node 22, 24 and
-    26: `npm ci`,
+26. **The gate** (added 2026-10-07, §13; Node 26 added in §14; triggers narrowed in §15):
+    `.github/workflows/ci.yml` runs on every pull request and on every push to `main`, on
+    Ubuntu, macOS and Windows with Node 22, 24 and 26: `npm ci`,
     `npm run check`, `npm test`, `npm run build`, `npm run format:check`; and a second job
     runs a plain `npm install` and fails if `package-lock.json` changed. It runs only where
     this package is a repository root.
@@ -640,6 +640,20 @@ All commands from the copy's root.
     unchanged.
 34. **The ingest CLI's deadline** (added 2026-10-07, §14): a real (non-dry-run) ingest
     whose store never answers is abandoned at 60 seconds, not at the chat default of 2.
+35. **A message with no meaningful word** (added 2026-10-07, §15): on real Postgres, a
+    message that is empty, blank, only stop words, only punctuation or a lone minus matches
+    nothing by keyword and raises nothing; the vector half answers as if nothing was typed.
+36. **Version 0.1.1** (added 2026-10-07, §15): `package.json`, the lockfile's two root
+    entries, `VERSION` and `GET {base}/health` all say `0.1.1`.
+37. **A blank `AGENT_MODEL`** (added 2026-10-07, §15): empty or only spaces, as
+    `.env.example` ships it, counts as unset: the file's model stands, or the default.
+38. **A key is needed only for what the environment builds** (added 2026-10-07, §15):
+    `defineAgentFromEnv(file)` does not read `ANTHROPIC_API_KEY` when the file supplies
+    the `modelClient`, `VOYAGE_API_KEY` when it supplies `embeddings`, or the two Supabase
+    variables when it supplies all three of `vectorStore`, `conversations` and `events`.
+    Any part it leaves out still needs its variable, and the error names it. When only
+    some stores are supplied, each supplied store is the one used and only the missing
+    ones come from Supabase. `fromEnv()` on its own still needs all four.
 
 ## 10. Out of scope (deliberate)
 
@@ -922,3 +936,89 @@ guards (26 new breaks; 129 in all, 129 red).
 
 **Not in this change.** The shape of the keyword query (item 4); a spoken fallback for the
 empty reply (item 8).
+
+## 15. Amendment — 2026-10-07, keys on demand; an any-word keyword query, held
+
+**Why.** Three small notes from review, and one change to the workflow's triggers. This
+section also records a larger change that was built and then held: a new keyword query.
+It is not in this version, and what it measured is written down at the end so the next
+design starts from it.
+
+**What changes for a deployment.** Nothing published changes behaviour. `fromEnv` gains an
+option, and `defineAgentFromEnv` uses it, so a config that brings part of its own runtime
+is no longer asked for a key it will never use. That is a compatible addition. The package
+is below 1.0, where a patch number is the usual carrier for one, so the version goes to
+0.1.1.
+
+**The exact change.**
+
+1. **A key only for what the environment builds** (§9.38; `src/config.ts`).
+   `defineAgentFromEnv` called `fromEnv()` first, so all four keys were demanded even when
+   the config file supplied that part of the runtime. The choice was to say so in the
+   README or to stop demanding them. It stops: `fromEnv` takes `supplied`, the parts of
+   the runtime the caller already has, and reads a key only for a part it has to build.
+   One Supabase client serves all three stores, so the two Supabase variables are needed
+   unless all three stores are supplied; when only some are, each supplied store is the
+   one used. `fromEnv()` with no argument is unchanged: all four keys, and a full runtime.
+2. **A blank `AGENT_MODEL`** (§9.37). Behaviour was right and untested. One test.
+3. **The workflow's triggers** (§9.26). `on: push` ran every job twice on a pull request,
+   once for the push to the branch and once for the pull request. It now runs on pull
+   requests and on pushes to `main`. The job names are unchanged.
+4. **Version 0.1.1** (§9.36). `package.json`, the lockfile, `VERSION` in `src/config.ts`,
+   and the health test.
+5. **One test added on real Postgres** (§9.35): a message with no meaningful word matches
+   nothing by keyword and raises nothing. It was written for the held change and is true
+   of the published function too, so it stays: whatever the keyword half becomes, a
+   visitor who types "?" must not get an error.
+
+**`src/` changes in one file:** `config.ts`. Compiled with comments stripped, `src/` differs
+from the previous build in `config.js` only.
+
+**Built and held: an any-word keyword query.**
+
+§14 disclosed that the keyword half is silent on ordinary questions, because the whole
+message goes to `websearch_to_tsquery`, which needs every word in the passage. A change
+was built that replaced that query with
+
+```sql
+replace(plainto_tsquery('english', left(query_text, 10000))::text, ' & ', ' | ')::tsquery
+```
+
+so that a passage holding any one meaningful word of the message matches, ranked by
+`ts_rank`. `plainto_tsquery` recognises no operators, so nothing a visitor types is read as
+syntax. It was built with tests and measured on real Postgres 18.3.
+
+- *What it fixed.* On the shipped example content, three full-sentence questions went
+  from no keyword match to a match with the right passage on top: "Do you fix water
+  heaters?" 0 → 1, "What time do you open on Saturday?" 0 → 2, "Is there a travel fee
+  outside the county?" 0 → 1.
+- *What it got wrong.* A fourth question, found in review, on the same content: "Can you
+  repair my boiler the same day?" becomes `'repair' | 'boiler' | 'day'`, and the keyword
+  half ranks Water heaters first (0.0405, for "repair" and "day"), Emergencies second
+  (0.0253, for "day" twice) and Heating, which is the answer, third (0.0203, for
+  "boilers").
+- *Why that matters in the fusion.* Both halves weigh the same. With Heating first in the
+  vector half and Water heaters second, the function returned Water heaters first:
+  1/62 + 1/61 = 0.03252 beats 1/61 + 1/63 = 0.03227. A right answer in the vector half
+  was outvoted by a wrong one in the keyword half, on a question where the published
+  function's keyword half says nothing at all.
+- *The rank itself.* For a two-word query, a passage with both words once scores 0.0608;
+  one word once, 0.0304; one word six times, 0.0453; one word fifty times, 0.0494. More of
+  the words beats repetition. What the rank does not know is which word is the telling
+  one: "boiler" counts the same as "day".
+- *A limit found on the way.* A message of about 2.6 MB of distinct words makes the
+  published function raise `value is too big in tsquery`. The handler's default limit of
+  2,000 characters keeps a visitor far from it. The held change capped the keyword text
+  at 10,000 characters; the published function has no cap.
+- *Why it is held.* Every meaningful word counts the same. That turns the keyword half
+  from silent on full questions into a voter on every question, with an equal vote. It
+  needs a design pass (what to send as the keyword query, and how the two halves are
+  weighed), not a one-line query change.
+
+Until then the keyword half is as published: the migration, the memory store and the
+README's disclosure are unchanged.
+
+**How it was checked.** As §13 and §14. Each new test was shown to fail on a deliberate
+break of what it guards.
+
+**Not in this change.** The shape of the keyword query; anything else about ranking.

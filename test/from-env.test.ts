@@ -12,14 +12,17 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import {
   DEFAULT_MODEL,
   DEFAULT_STORE_TIMEOUT_MS,
+  FeatureHashEmbeddings,
   MemoryEventSink,
   createAgentHandler,
+  createMemoryStores,
   defineAgentFromEnv,
   fromEnv,
   type AgentFile,
   type ResolvedAgentConfig,
 } from '../src/index.js';
-import { MockModelClient } from '../src/testing/mock-model.js';
+import { MockModelClient, stop, textDelta } from '../src/testing/mock-model.js';
+import { readSSE } from './harness.js';
 import { INGEST_STORE_TIMEOUT_MS, runIngest } from '../scripts/ingest-cli.js';
 
 const REQUIRED = {
@@ -90,6 +93,18 @@ describe('defineAgentFromEnv: a config file in, a production agent out (SPEC §9
     expect(await preflight(agent, 'https://harborbooks.example')).toBe(204);
   });
 
+  it.each(['', '   '])(
+    'a blank AGENT_MODEL (%j), as .env.example ships it, counts as unset',
+    (blank) => {
+      vi.stubEnv('AGENT_MODEL', blank);
+
+      expect(defineAgentFromEnv(FILE).model).toBe('model-from-the-file');
+      expect(defineAgentFromEnv({ business: FILE.business, persona: FILE.persona }).model).toBe(
+        DEFAULT_MODEL,
+      );
+    },
+  );
+
   it('with no model anywhere it is the default, and with no allowlist anywhere a browser is refused', async () => {
     const bare: AgentFile = { business: FILE.business, persona: FILE.persona };
 
@@ -127,6 +142,112 @@ describe('defineAgentFromEnv: a config file in, a production agent out (SPEC §9
     expect(() => defineAgentFromEnv(FILE)).toThrow(
       `Missing required environment variable: ${name}. See .env.example.`,
     );
+  });
+});
+
+// A config file may bring part of the runtime with it. The key for a part it brings is not
+// asked for; the key for a part it leaves to the environment still is.
+describe('a key is needed only for what the environment builds (SPEC §9.38)', () => {
+  const without = (...names: string[]): void => {
+    for (const name of names) vi.stubEnv(name, undefined);
+  };
+  const stores = (): ReturnType<typeof createMemoryStores> & { events: MemoryEventSink } => ({
+    ...createMemoryStores(),
+    events: new MemoryEventSink(),
+  });
+
+  it('a config with its own model client needs no Anthropic key, and still needs the rest', () => {
+    const own = new MockModelClient([]);
+    without('ANTHROPIC_API_KEY');
+
+    expect(defineAgentFromEnv({ ...FILE, runtime: { modelClient: own } }).runtime.modelClient).toBe(
+      own,
+    );
+
+    without('VOYAGE_API_KEY');
+    expect(() => defineAgentFromEnv({ ...FILE, runtime: { modelClient: own } })).toThrow(
+      'Missing required environment variable: VOYAGE_API_KEY.',
+    );
+  });
+
+  it('a config with its own embedder needs no Voyage key', () => {
+    const own = new FeatureHashEmbeddings();
+    without('VOYAGE_API_KEY');
+
+    expect(defineAgentFromEnv({ ...FILE, runtime: { embeddings: own } }).runtime.embeddings).toBe(
+      own,
+    );
+  });
+
+  it('a config with all three stores needs neither Supabase variable; with only some it needs both', () => {
+    const own = stores();
+    without('SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY');
+
+    const agent = defineAgentFromEnv({ ...FILE, runtime: own });
+    expect(agent.runtime.vectorStore).toBe(own.vectorStore);
+    expect(agent.runtime.conversations).toBe(own.conversations);
+    expect(agent.runtime.events).toBe(own.events);
+
+    // One Supabase client serves all three, so leaving any one out brings the need back.
+    for (const part of ['vectorStore', 'conversations', 'events'] as const) {
+      const { [part]: _left, ...two } = own;
+      expect(() => defineAgentFromEnv({ ...FILE, runtime: two }), part).toThrow(
+        'Missing required environment variable: SUPABASE_URL.',
+      );
+    }
+  });
+
+  it('with only some stores supplied, each supplied one is used and only the missing one is built', () => {
+    const fromTheEnvironment = fromEnv().runtime;
+    const parts = ['vectorStore', 'conversations', 'events'] as const;
+
+    for (const missing of parts) {
+      const own = stores();
+      const { [missing]: _left, ...two } = own;
+
+      const { runtime } = defineAgentFromEnv({ ...FILE, runtime: two });
+
+      for (const part of parts) {
+        if (part === missing) {
+          // Built here: not the config's, and the class fromEnv() builds.
+          expect(runtime[part], `${part}, left out`).not.toBe(own[part]);
+          expect(runtime[part].constructor, `${part}, left out`).toBe(
+            fromTheEnvironment[part].constructor,
+          );
+        } else {
+          // The Supabase client exists now, and the config's store is still the one used.
+          expect(runtime[part], `${part}, with ${missing} left out`).toBe(own[part]);
+        }
+      }
+    }
+  });
+
+  it('a config that brings everything needs no environment at all, and serves a turn', async () => {
+    without(...Object.keys(REQUIRED));
+    const runtime = {
+      modelClient: new MockModelClient([[textDelta('All mine.'), stop('end_turn')]]),
+      embeddings: new FeatureHashEmbeddings(),
+      ...stores(),
+    };
+
+    const agent = defineAgentFromEnv({ ...FILE, rag: { enabled: false }, runtime });
+    const res = await createAgentHandler(agent)(
+      new Request('http://host/desk/chat', {
+        method: 'POST',
+        headers: { origin: 'https://harborbooks.example', 'content-type': 'application/json' },
+        body: JSON.stringify({ message: 'hello' }),
+      }),
+    );
+
+    expect((await readSSE(res)).map((f) => f.event)).toEqual(['meta', 'text', 'done']);
+  });
+
+  it('fromEnv() on its own still needs all four', () => {
+    for (const name of Object.keys(REQUIRED)) {
+      vi.stubEnv(name, undefined);
+      expect(() => fromEnv(), name).toThrow(`Missing required environment variable: ${name}.`);
+      vi.stubEnv(name, REQUIRED[name as keyof typeof REQUIRED]);
+    }
   });
 });
 

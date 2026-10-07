@@ -369,6 +369,27 @@ describe('ddj_match_chunks on real Postgres (SPEC §9.22)', () => {
     expect((await keywordMatches('open saturday')).postgres).toEqual(['saturday']);
   });
 
+  it('a message with no meaningful word matches nothing by keyword and raises nothing', async () => {
+    // The last chunk holds all three of "the", "of" and "and". Stop words are dropped twice,
+    // from the stored column and from the query, so "the of and" finds it only if both stop
+    // dropping them. With one side changed alone this test stays green.
+    await seed([
+      ...decoys(),
+      chunk('heater-repair', 101, 'Water heater repair and installation.'),
+      chunk('leak', 102, 'We fix a leak the same day.'),
+      chunk('stop-words', 103, 'The top of the tank and the valve.'),
+    ]);
+    const onlyTheVectorHalf: Scores = {};
+    for (let n = 1; n <= 12; n++) onlyTheVectorHalf[`decoy${pad(n)}`] = 1 / (60 + n);
+
+    // Empty, blank, only stop words, only punctuation, a lone minus.
+    for (const text of ['', '   ', 'the of and', 'Do you?', '?!.,;:()[]{}', '-', ' - ']) {
+      const { postgres } = await match(text);
+      // No error, no keyword match, and the vector half answers as if nothing was typed.
+      expectScores(postgres, onlyTheVectorHalf);
+    }
+  });
+
   it('keeps the 12 nearest whatever their distance; the memory store drops what is not similar', async () => {
     // The README's own example: three chunks, a query vector for "alpha", the word "beta".
     const hasher = new FeatureHashEmbeddings();

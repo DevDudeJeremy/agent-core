@@ -20,7 +20,7 @@ import { requestHandoff } from './tools/request-handoff.js';
 import type { Reranker } from './rag/retrieve.js';
 
 /** Keep in sync with package.json `version`. Surfaced by GET {base}/health. */
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.1';
 export const PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_MODEL = 'claude-haiku-4-5';
 
@@ -193,9 +193,13 @@ export function defineAgent(config: AgentConfig): ResolvedAgentConfig {
  * Build a production runtime from environment variables. Throws a clear, named error the
  * FIRST time it is called with a missing var — never at import. Every `process.env` read in
  * this package lives inside this function body. `storeTimeoutMs` is the deadline for each
- * request to the store; leave it out for the default, which suits a chat reply.
+ * request to the store; leave it out for the default, which suits a chat reply. `supplied`
+ * is any part of the runtime the caller already has: a key is read only for a part that has
+ * to be built here, so with nothing supplied all four are required.
  */
-export function fromEnv(options: { storeTimeoutMs?: number } = {}): {
+export function fromEnv(
+  options: { storeTimeoutMs?: number; supplied?: Partial<AgentRuntime> } = {},
+): {
   runtime: AgentRuntime;
   model?: string;
   allowedOrigins: string[];
@@ -208,26 +212,34 @@ export function fromEnv(options: { storeTimeoutMs?: number } = {}): {
     return value;
   };
 
-  const anthropicKey = need('ANTHROPIC_API_KEY');
-  const voyageKey = need('VOYAGE_API_KEY');
-  const supabaseUrl = need('SUPABASE_URL');
-  const supabaseKey = need('SUPABASE_SERVICE_ROLE_KEY');
+  // Each variable is asked for only when its part has to be built, and in this order, so a
+  // host missing several is told about the same one first every time.
+  const supplied = options.supplied ?? {};
+  const modelClient =
+    supplied.modelClient ?? AnthropicModelClient.fromApiKey(need('ANTHROPIC_API_KEY'));
+  const embeddings =
+    supplied.embeddings ?? new VoyageEmbeddings({ apiKey: need('VOYAGE_API_KEY') });
+  // One Supabase client serves all three stores, so it is needed unless all three came in.
+  const supabase =
+    supplied.vectorStore && supplied.conversations && supplied.events
+      ? null
+      : createSupabaseStores(need('SUPABASE_URL'), need('SUPABASE_SERVICE_ROLE_KEY'), {
+          timeoutMs: options.storeTimeoutMs,
+        });
+
   const model = process.env.AGENT_MODEL?.trim() || undefined;
   const allowedOrigins = (process.env.AGENT_ALLOWED_ORIGINS ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const { vectorStore, conversations, events } = createSupabaseStores(supabaseUrl, supabaseKey, {
-    timeoutMs: options.storeTimeoutMs,
-  });
-
   const runtime: AgentRuntime = {
-    modelClient: AnthropicModelClient.fromApiKey(anthropicKey),
-    embeddings: new VoyageEmbeddings({ apiKey: voyageKey }),
-    vectorStore,
-    conversations,
-    events,
+    modelClient,
+    embeddings,
+    // `supabase` is null only when all three of these were supplied.
+    vectorStore: supplied.vectorStore ?? supabase!.vectorStore,
+    conversations: supplied.conversations ?? supabase!.conversations,
+    events: supplied.events ?? supabase!.events,
   };
 
   return { runtime, model, allowedOrigins };
@@ -237,19 +249,20 @@ export function fromEnv(options: { storeTimeoutMs?: number } = {}): {
  * The production path in one call: build the runtime from the environment and apply the two
  * settings a deployment host may override. `AGENT_MODEL`, when set, wins over the file's
  * `model`. A non-empty `AGENT_ALLOWED_ORIGINS` replaces the file's `http.allowedOrigins`;
- * unset, the file's list stands. A runtime part the file supplies is the one used.
+ * unset, the file's list stands. A runtime part the file supplies is the one used, and the
+ * key for that part is not asked for.
  */
 export function defineAgentFromEnv(
   file: AgentFile,
   options: { storeTimeoutMs?: number } = {},
 ): ResolvedAgentConfig {
-  const env = fromEnv(options);
+  const env = fromEnv({ ...options, supplied: file.runtime });
   const allowedOrigins =
     env.allowedOrigins.length > 0 ? env.allowedOrigins : (file.http?.allowedOrigins ?? []);
   return defineAgent({
     ...file,
     model: env.model ?? file.model,
     http: { ...file.http, allowedOrigins },
-    runtime: { ...env.runtime, ...file.runtime },
+    runtime: env.runtime,
   });
 }
