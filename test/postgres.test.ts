@@ -268,11 +268,14 @@ describe('the migration on real Postgres (SPEC §9.22)', () => {
 
     // The README and the spec name this server, by this number, as the one the suite runs
     // on. If a dependency bump changes it, this fails, and the words must change with it.
+    // Soft, so that the assertions after it still run and report when it does.
     const version = await db.query<{ v: string }>('select version() as v');
-    expect(
-      version.rows[0]!.v,
-      'the suite no longer runs on PostgreSQL 18.3: README.md and the spec name that version, so they must change with this line',
-    ).toMatch(/^PostgreSQL 18\.3 /);
+    expect
+      .soft(
+        version.rows[0]!.v,
+        'the suite no longer runs on PostgreSQL 18.3: README.md and the spec name that version, so they must change with this line',
+      )
+      .toMatch(/^PostgreSQL 18\.3 /);
     const ext = await db.query<{ extname: string }>(
       "select extname from pg_extension where extname = 'vector'",
     );
@@ -1009,27 +1012,40 @@ describe('the keyword half: more than half of the words (SPEC §9.39)', () => {
 
     it('control: the 0.1.x function raises on megabytes and on such a word, in this database; the function in force does not', async () => {
       await seed(fixture());
-      // About 2.6 MB of distinct words, as in KC-9, and the unbroken words of rows 1 to 3.
+      // About 2.6 MB of distinct words, as in KC-9, and the unbroken words of rows 1 to 3,
+      // with the top of the range for the second letter.
       const megabytes = `${Array.from({ length: 250_000 }, (_, i) => `word${i}`).join(' ')} drain`;
-      const longWords = [A_STROKE.repeat(683), A_STROKE.repeat(1_023), T_STROKE.repeat(683)];
+      /** [what it is, the word]. Each is named, so that a red says which one. */
+      const longWords: Array<[string, string]> = [
+        ['683 copies of U+023A', A_STROKE.repeat(683)],
+        ['1,023 copies of U+023A', A_STROKE.repeat(1_023)],
+        ['683 copies of U+023E', T_STROKE.repeat(683)],
+        ['1,023 copies of U+023E', T_STROKE.repeat(1_023)],
+      ];
 
       await withFunction(publishedFunction(), async () => {
         // The instrument: an ordinary word is answered, so a raise below is the message's.
         expect(ids(byKeyword(await sqlRows('drain'))).sort()).toEqual(BOTH);
 
         await expect(sqlRows(megabytes)).rejects.toThrow(/value is too big in tsquery/);
-        for (const word of longWords) {
-          await expect(sqlRows(word), `${Array.from(word).length} copies`).rejects.toThrow(
-            /word is too long in tsquery/,
+        for (const [what, word] of longWords) {
+          // The outcome is read first. `rejects` drops the label when the promise resolves,
+          // and then a red would not say which word had stopped raising.
+          const outcome = await sqlRows(word).then(
+            () => 'was answered',
+            (e: unknown) => String((e as Error)?.message ?? e),
           );
+          expect(outcome, what).toMatch(/word is too long in tsquery/);
         }
-        // One copy under that range, and one over it: nothing raises.
-        expect(byKeyword(await sqlRows(A_STROKE.repeat(682)))).toEqual([]);
-        expect(byKeyword(await sqlRows(A_STROKE.repeat(1_024)))).toEqual([]);
+        // One copy under that range, and one over it, of each letter: nothing raises.
+        for (const letter of [A_STROKE, T_STROKE]) {
+          expect(byKeyword(await sqlRows(letter.repeat(682)))).toEqual([]);
+          expect(byKeyword(await sqlRows(letter.repeat(1_024)))).toEqual([]);
+        }
       });
 
       // With the function in force back, none of them raises.
-      for (const text of [megabytes, ...longWords]) {
+      for (const text of [megabytes, ...longWords.map(([, word]) => word)]) {
         expect(byKeyword(await sqlRows(text))).toEqual([]);
       }
     }, 60_000);

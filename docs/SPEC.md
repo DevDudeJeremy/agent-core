@@ -608,7 +608,7 @@ All commands from the copy's root.
     every file in `supabase/migrations/` to an in-process Postgres with pgvector, twice,
     with no error. The same test holds that server to PostgreSQL 18.3, the version the
     README and §16 name, so a dependency bump that changes it fails and says why
-    (added 2026-10-08, §16). Against it: a vector-only and a keyword-only match both surface; fused
+    (added 2026-10-08: the note that closes §16). Against it: a vector-only and a keyword-only match both surface; fused
     scores equal the RRF values for hand-set ranks; each channel is cut at 12; the
     keyword half behaves as §9.39 says (amended 2026-10-07, §16; until then: "a multi-word
     query follows `websearch_to_tsquery`: all words, stemmed, stop words dropped, quoted
@@ -831,8 +831,9 @@ All commands from the copy's root.
       are ASCII letters and digits, so it asks one word where Postgres asks two. Control,
       on the same fixture and in this database only: with the 0.1.x function in place,
       about 2.6 MB of distinct words raises `value is too big in tsquery`; one unbroken
-      word of 683 or 1,023 of `Ⱥ`, or 683 of `Ⱦ`, raises `word is too long in tsquery`;
-      682 and 1,024 of `Ⱥ` do not raise. With the function in force back, none does.
+      word of 683 or 1,023 of `Ⱥ`, or of 683 or 1,023 of `Ⱦ`, raises `word is too long
+      in tsquery`; 682 and 1,024 of either do not raise. With the function in force back,
+      none does.
     - **KC-22, the sweep.** Every length from 1 to 1,100 of `Ⱥ` and of `Ⱦ`, alone and
       after `drain`: 4,400 messages, asked inside the database. None raises. Alone, no
       keyword row. After `drain`, none below 100 copies and both passages from 100 on.
@@ -1604,6 +1605,18 @@ raise its own error.
 **Not in this change.** Any weighting of words; phrase search as an option; a relevance
 floor on the vector half; an order for ties in the fused score; a stemmer in the
 stand-in; content that is not English; the reranker.
+
+**Three checks, added 2026-10-08, and four corrections to them.** Three sentences of
+this section and of the README rested on runs kept as evidence, and are held by tests
+since 0.3.0: the suite's own server is PostgreSQL 18.3 (§9.22); the 0.1.x function
+raises in that database on megabytes of text and on one long unbroken word, and the
+function in force does not (the control beside KC-21); and KC-5's control asserts why
+neither earlier rule brings the part to the model. A review of them left four small
+things, corrected in 0.3.1 with no change to any source file or to the number of tests.
+This note is the dated entry §9.22 points at. The version assertion no longer stops the
+assertions that follow it in the same test from running. When a word that should make
+the 0.1.x function raise is answered, the failure names the word. And the control holds
+three more points of the range: 1,023 copies of `Ⱦ` raise, 682 and 1,024 do not.
 
 ## 17. Amendment — 2026-10-08, text in the request body that Postgres cannot store
 
