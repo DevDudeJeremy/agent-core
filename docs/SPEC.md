@@ -603,7 +603,9 @@ All commands from the copy's root.
     client that buffered would leave these tests unable to finish.
 22. **The SQL on real Postgres** (added 2026-10-07, §13): `test/postgres.test.ts` applies
     every file in `supabase/migrations/` to an in-process Postgres with pgvector, twice,
-    with no error. Against it: a vector-only and a keyword-only match both surface; fused
+    with no error. The same test holds that server to PostgreSQL 18.3, the version the
+    README and §16 name, so a dependency bump that changes it fails and says why
+    (added 2026-10-08, §16). Against it: a vector-only and a keyword-only match both surface; fused
     scores equal the RRF values for hand-set ranks; each channel is cut at 12; the
     keyword half behaves as §9.39 says (amended 2026-10-07, §16; until then: "a multi-word
     query follows `websearch_to_tsquery`: all words, stemmed, stop words dropped, quoted
@@ -724,7 +726,10 @@ All commands from the copy's root.
       have the AR-4420 in stock for my tank?" with a limit of 4, the function returns the
       part's passage among the four, at 1/61. The stand-in returns the same four. Control,
       part of the criterion: with an any-word keyword half, and with the every-word one of
-      0.1.x, the same call returns the four tank passages and not the part.
+      0.1.x, the same call returns the four tank passages and not the part. The control
+      asserts why as well: under the any-word rule each of the four scores more than
+      1/61, which only a passage in both lists can; under the every-word rule each scores
+      its vector share alone, 1/61 to 1/64.
     - **KC-6, a paraphrase the vector half ranks first.** The passage that answers shares
       no word with "What happens if I need to call it off last minute?" and is nearest the
       query; four others each share a common word. With a limit of 4 it comes back first;
@@ -804,7 +809,10 @@ All commands from the copy's root.
       and in the stand-in, the cut at 10,000 removed, the cut counted in UTF-16 units,
       the run bound removed, `sourceId` compared with `<`, `chunkIndex` dropped from the
       order, and the `u` flag off the run pattern, so that a run is counted in the units
-      of a JavaScript string.
+      of a JavaScript string. For the controls: the first migration's function given the
+      two bounds, so that 0.1.x no longer raises; the any-word control made every-word;
+      the first migration's keyword half made any-word; and, standing in for a database
+      that is not 18.3, the expected version changed.
     - **KC-20, cost.** Measured once and recorded in §16. No timing assertion is in the
       suite: a clock on a shared runner is not a gate.
     - **KC-21, no word of a message can reach the limit on a word.** Decoys, a passage
@@ -816,7 +824,11 @@ All commands from the copy's root.
       tab and a carriage return each break a run; a no-break space and a form feed do
       not. The cut at 10,000 comes before the runs are removed, and counts characters.
       The stand-in parts from Postgres on one message, `drain` and 99 of `Ⱥ`: its words
-      are ASCII letters and digits, so it asks one word where Postgres asks two.
+      are ASCII letters and digits, so it asks one word where Postgres asks two. Control,
+      on the same fixture and in this database only: with the 0.1.x function in place,
+      about 2.6 MB of distinct words raises `value is too big in tsquery`; one unbroken
+      word of 683 or 1,023 of `Ⱥ`, or 683 of `Ⱦ`, raises `word is too long in tsquery`;
+      682 and 1,024 of `Ⱥ` do not raise. With the function in force back, none does.
     - **KC-22, the sweep.** Every length from 1 to 1,100 of `Ⱥ` and of `Ⱦ`, alone and
       after `drain`: 4,400 messages, asked inside the database. None raises. Alone, no
       keyword row. After `drain`, none below 100 copies and both passages from 100 on.
@@ -1364,14 +1376,15 @@ stored and the model is not called.
   `word is too long in tsquery`. This one is inside the HTTP layer's limit. With 682 or
   with 1,024 of them it does not raise.
 
-Both raise in the test database (PostgreSQL 18.3). The second was also run outside the
-suite, with the 0.1.x function on the seven servers above. It raises on PostgreSQL 15.14,
-16.10 and 17.6: on each, 6 of the 17 messages of KC-21 and 1,364 of the 30,000. It does
-not raise on 15.19, 16.15, 17.11 or 18.6: none of the 17 and none of the 30,000 on each.
-Outside the suite that is two builds of each of 15, 16 and 17, where the earlier one
-raises and the later one does not, and one build of 18. Builds between those were not
-run. 0.2.0 is the fix. There is no patch for 0.1.x, because the fix is the second
-migration, and going back to the first file restores the fault.
+Both raise in the test database (PostgreSQL 18.3), where a control beside KC-21 holds it.
+The second was also run outside the suite, with the 0.1.x function on the seven servers
+above. It raises on PostgreSQL 15.14, 16.10 and 17.6: on each, 6 of the 17 messages of
+KC-21 and 1,364 of the 30,000. It does not raise on 15.19, 16.15, 17.11 or 18.6: none of
+the 17 and none of the 30,000 on each. Outside the suite that is two builds of each of
+15, 16 and 17, where the earlier one raises and the later one does not, and one build of
+18. Builds between those were not run. 0.2.0 is the fix. There is no patch for 0.1.x,
+because the fix is the second migration, and going back to the first file restores the
+fault.
 
 **A stored passage is not bounded.** The first migration builds `fts` from a passage as
 it is. In the test database a passage holding `marker` and one unbroken word of 683 of
@@ -1691,8 +1704,8 @@ Nothing has to be applied, migrated or ingested again.
    of the lockfile, the health test.
 3. **`src/stores/memory.ts`, a comment.** Its header says what these stores accept that a
    database refuses. It now also says the handler refuses such a body first.
-4. **Tests** (§9.41, `test/handler.test.ts`), twenty-one of them: 201 in 13 files, where
-   there were 180. Each of the four strings, with a NUL and with an unpaired surrogate,
+4. **Tests** (§9.41, `test/handler.test.ts`), twenty-one of them: 202 in 13 files, where
+   there were 181. Each of the four strings, with a NUL and with an unpaired surrogate,
    gets the 400 naming it, with the CORS header an error carries, and nothing is touched:
    no call to the conversation store, no event, the `onEvent` hook not called, no model
    call. `message` also with a lone low surrogate, with a pair the wrong way round, and
