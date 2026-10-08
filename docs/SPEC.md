@@ -1,6 +1,6 @@
 # agent-core — design spec
 
-**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15, §16), 2026-10-08 (§17)
+**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15, §16), 2026-10-08 (§17, §18)
 
 The design spec this package was built and reviewed against. `SPEC §n` in source comments
 and test names points at a section of this file. Edited for publication: references to
@@ -369,7 +369,8 @@ agent-core/
     │                              #   (which messages, and that it opens on a user turn)
     ├── gates.test.ts              # gated tool NOT executed; approval event; model informed
     ├── handoff.test.ts            # escalation: event, handed_off status, SSE handoff frame (§9.15)
-    ├── chunk.test.ts              # sizes, overlap, heading boundaries, breadcrumbs, determinism
+    ├── chunk.test.ts              # sizes, overlap, heading boundaries, breadcrumbs, determinism;
+    │                              #   no chunk holds half of a character (§9.42)
     ├── retrieve.test.ts           # hybrid ranking, RRF fusion math, pinned constants and
     │                              #   the frozen first migration (§9.16), reranker hook,
     │                              #   ingest idempotency
@@ -498,8 +499,10 @@ All commands from the copy's root.
    business name appear; extra rules appear **after** the non-negotiables; the context
    block carries the untrusted-data framing and per-chunk source markers.
 7. **Chunker:** deterministic (same input → identical chunks); no chunk exceeds
-   maxChars; consecutive chunks overlap by the configured amount; chunks never span an
-   `##` heading boundary; each chunk is prefixed with its heading breadcrumb.
+   maxChars; consecutive chunks overlap by the configured amount, or by one or two units
+   fewer where an edge was moved off a character above U+FFFF (amended 2026-10-08, §18;
+   see §9.42); chunks never span an `##` heading boundary; each chunk is prefixed with
+   its heading breadcrumb.
 8. **Retrieval:** with `FeatureHashEmbeddings` + memory store — a keyword-only match and
    a vector-only match both surface; RRF fusion (k=60) ranking verified against a
    hand-computed expectation; custom reranker hook is invoked and can reorder; `topK`
@@ -679,9 +682,10 @@ All commands from the copy's root.
 35. **A message with no meaningful word** (added 2026-10-07, §15): on real Postgres, a
     message that is empty, blank, only stop words, only punctuation or a lone minus matches
     nothing by keyword and raises nothing; the vector half answers as if nothing was typed.
-36. **Version** (added 2026-10-07, §15, as 0.1.1; 0.2.0 as of §16; **0.3.0 as of §17**):
+36. **Version** (added 2026-10-07, §15, as 0.1.1; 0.2.0 as of §16; 0.3.0 as of §17;
+    **0.3.1 as of §18**):
     `package.json`, the lockfile's two root entries, `VERSION` and `GET {base}/health` all
-    say `0.3.0`.
+    say `0.3.1`.
     A test holds `package.json` and both lockfile entries to `VERSION`, so one of them
     left behind fails the suite.
 37. **A blank `AGENT_MODEL`** (added 2026-10-07, §15): empty or only spaces, as
@@ -877,6 +881,26 @@ All commands from the copy's root.
     refused body counts against the rate limit. A message that is too long and also
     holds a NUL gets the answer a too-long message gets. Held on the in-memory stores, by
     `test/handler.test.ts`; on Supabase stores it is run outside the suite (§17).
+42. **A chunk never holds half of a character** (added 2026-10-08, §18). For text that is
+    well formed, no chunk holds an unpaired surrogate, at any `maxChars` and `overlap`.
+    An end that would fall between the two units of a character above U+FFFF is one unit
+    earlier, and a start that would fall there is one unit later. Where windows share
+    text, each chunk is the chunk made before this change at that place less those
+    halves: none is longer, and two neighbours share `overlap` units less one for each of
+    their two edges that moved (at the defaults 200, 199 or 198). Every character of a
+    section is whole in at least one chunk when `maxChars` and `overlap` are whole
+    numbers and `overlap` is 0 or more, and with an `overlap` of 0 the chunks join back
+    into the section's text. With one unit of room
+    for the text a chunk holds one whole character, which can be two units. No chunk is
+    empty, at sizes that are not whole numbers too. A document
+    with no window edge inside a character chunks to the bytes it chunked to before, in
+    the same order, at any setting that is a number: held against a copy of the earlier windowing kept in
+    the test file, and that copy against hashes recorded from the chunker before it was
+    changed. An unpaired surrogate already in the text stays where it is, and none is
+    added. What `ingestDocuments` hands the embedding provider and the store for a
+    document that was cut before holds no unpaired surrogate. Held by
+    `test/chunk.test.ts`, on the documents of the measurement in §18 and on a sweep of
+    leading offsets, heading lengths and settings.
 
 ## 10. Out of scope (deliberate)
 
@@ -1791,4 +1815,337 @@ input are stored too, and are not checked. Ingested content is one such text, an
 case of it was run, offline: the chunker cuts a long paragraph with no break in it by
 the units of a JavaScript string, and on a paragraph made of characters above U+FFFF it
 left chunks holding an unpaired surrogate. What a store does with such a chunk was not
-run. A bound on the length of `page` or of a `visitor` field.
+run. (Run since, and the chunker changed: §18.) A bound on the length of `page` or of a
+`visitor` field.
+
+## 18. Amendment — 2026-10-08, a chunk never holds half of a character
+
+**Why.** §17 named this and left it: the chunker cut text by the units of a JavaScript
+string, so a chunk could end or begin between the two units of a character above U+FFFF
+and hold an unpaired surrogate. This section closes it. An edge that would fall inside
+such a character now moves off it. Nothing else in the package changes.
+
+**Words.** A *unit* is one element of a JavaScript string. `maxChars` and `overlap` are
+counted in units, before this change and after it. A character above U+FFFF is two
+units: a high half (U+D800 to U+DBFF), then a low half (U+DC00 to U+DFFF). An edge is
+*inside a character* when the unit before it is a high half and the unit after it is a
+low half. Text is *well formed* when every half in it is part of such a pair. "Character"
+here means a code point, not everything a reader sees as one sign: see "Not in this
+change".
+
+**Measured first, on 0.2.0 as published.** `src/rag/chunk.ts` was the same file there.
+
+Which documents were cut, run offline at the default sizes (1,500 units a chunk, 200
+shared). The chunker slides one window over all the text under a heading, so it needs no
+long unbroken paragraph:
+
+| Document | Chunks holding an unpaired surrogate |
+| --- | --- |
+| 2,000 copies of U+1F600 with no break, after 0, 2 or 4 letters | 0 of 3 |
+| the same after 1, 3 or 5 letters | 3 of 3 |
+| the same with nothing in front, under a heading of 1, 3, 5 or 7 letters | 2 of 3 |
+| a page of thirty short paragraphs, letters only | 0 of 3 |
+| that page with one U+1F600 put where the first chunk ends | 1 of 3 |
+| that page with an emoji opening each paragraph, as written | 0 of 3 |
+| the same with 0 to 1,265 letters put in front of its first paragraph | cut at 55 of the 1,266 positions |
+| a line of 800 emoji between two sentences | 0 of 2; 2 of 2 with one letter added to the sentence above it |
+| 329 made-up words in Gothic letters, a script wholly above U+FFFF | 3 of 3 |
+
+Each character cut in one chunk was whole in a neighbouring chunk: no text was missing,
+one chunk was malformed.
+
+What an ingest did with such a document, run outside the suite on a Supabase stack:
+PostgreSQL 17.11, pgvector 0.8.2, PostgREST 16.4, both migration files applied by the
+Supabase CLI, `ingestDocuments` and `createSupabaseStores` with the word-hash stand-in
+for embeddings.
+
+- The database refused the insert of the document's chunks, all of them, when one held
+  an unpaired surrogate: code `22P02`, `invalid input syntax for type json`. `ingestDocuments`
+  threw `upsertDocument (insert chunks) failed`.
+- The store had already deleted that document's earlier chunks. A page that was stored
+  and answering a question, then edited so that one chunk was cut, was left with no
+  chunks, and the question returned nothing from it.
+- The document was left with its `pending:` marker. A second run embedded it again and
+  failed the same way.
+- Through the ingest script (`scripts/ingest.ts --dir`) on a folder of three files with
+  the second one cut: the first was stored, the run ended with exit code 1, and the
+  third was never reached, on the first run and on the second. `--dry-run` printed the
+  chunk counts and no warning.
+- The in-memory store took the same document without complaint.
+
+In that folder run the Voyage client was answered by a stand-in inside the process. What
+Voyage does with a text holding an unpaired surrogate was not run.
+
+**The rule.** The windows stay where the arithmetic put them before. Window *i* of a
+section is units `i × step` up to `i × step + size`, with
+`size = max(1, maxChars − the heading prefix)` and `step = max(1, size − overlap)`. One
+thing is added. An edge that would fall inside a character moves one unit, into its own
+window:
+
+- an **end** inside a character moves one unit **earlier**: the chunk stops before that
+  character;
+- a **start** inside a character moves one unit **later**: the chunk begins after it.
+
+An edge that is not inside a character does not move. So each chunk is the chunk made
+before less the half character at its end, at its start, or both, and a chunk can only
+get shorter.
+
+**Why inward.** The other rule would move every such edge one unit earlier, to the start
+of the character. Neighbours would then share 199 to 201 units. A chunk whose start moves
+earlier while its end stays is one unit longer than `maxChars`. Of the four ways to move
+the two edges by one unit, looking at nothing but the edge itself, start later and end
+earlier is the only one that never makes a chunk longer.
+
+**Sizes.** No chunk is longer than the chunk made before at the same place, so "no chunk
+exceeds `maxChars`" holds wherever it held. It held when the heading prefix was shorter
+than `maxChars`; a prefix as long as that already gave chunks of the prefix and one unit,
+and that is not changed. One setting goes over by one unit, below.
+
+**What neighbours share.** The last `overlap` units of a chunk are the first `overlap`
+units of the next, wherever no edge moved. The shared stretch is one unit shorter when
+the earlier chunk's end moved, one unit shorter when the later chunk's start moved, and
+two shorter when both did. At the defaults: 200, 199 or 198 units.
+
+**Nothing is left out.** When windows share at least one unit, the character a chunk
+stops before, or begins after, is whole in the neighbouring chunk, whose own edge lies at
+least one unit beyond it. So every character of a section is whole in at least one
+chunk, as every unit was in at least one chunk before.
+
+**When windows share nothing** (an `overlap` of 0, or one unit of room, next), there is
+no neighbour to hold that character, and the rule above alone would drop it. So here each
+window begins where the one before it really ended, not where the arithmetic put it. The
+character a chunk stopped before is the first of the next chunk, and each later window of
+that section sits one unit earlier for every such stop. The chunks still join back into
+the section's text exactly, and there can be more of them than before.
+
+**One unit of room.** When the heading prefix leaves one unit for the text (or `maxChars`
+is 1) and `overlap` is 0 or more, each chunk held one unit, and a character above U+FFFF
+was cut in every case. Such a chunk now holds the whole character: two units. That is the
+one setting where a chunk is longer than before, by one unit, and it needs `maxChars` to
+be no more than the heading prefix plus one.
+
+**Other settings.** A negative `overlap` leaves text between windows in no chunk. That is
+not changed: those windows stay where they are and lose the half at an edge. A window
+that would be left empty is not emitted: that takes a window of two units, or a negative
+`overlap`.
+
+Two more, found by the code review of this change. A `maxChars` or an `overlap` that is
+not a whole number is cut where `slice` cuts it, as before, and gives no empty chunk. And
+when `overlap` is the window less one unit, or more, windows advance one unit at a time,
+as before: two of them that differed only by a half can now be the same stretch of text,
+so one chunk can appear twice. Nobody would choose that setting, and it is left so.
+
+Three more, from a second review. With windows that share nothing and a room between
+one and two units, the first build crept: a window left empty before a two-unit
+character advanced by the fraction over one, so 200 copies of U+1F600 at a `maxChars` of
+1.0000001 took over a minute, where the code before took 0.07 ms. A window that shares
+nothing with its neighbours (`step` equals `size`) and is left empty now takes the whole
+character, so there every pass moves on by at least one unit. A `maxChars` that is not a
+number gave one chunk holding only the heading prefix, and gives none now. An `overlap`
+that is not a number ends the loop after the first window, as before.
+
+**Sizes that are not whole numbers: what holds and what does not.** Found by a third reading of this change.
+Sizes are counted in units, so they are whole numbers; nothing stops a caller passing
+2.5. `slice` cuts a position that is not a whole number down to the unit below it, so
+two windows whose places overlap by half a unit can share no text while `step` is less
+than `size`. "Nothing is left out", above, rests on windows sharing at least one unit,
+and the rule for windows that share nothing is taken only when `step` equals `size`. So
+at such a setting a two-unit character on an edge can be in no chunk: at a `maxChars` of
+2.5 and an `overlap` of 0.5, a letter and twelve copies of U+1F600 give one chunk, the
+letter. Before this change that text gave thirteen chunks, every one holding half of a
+character.
+
+Measured on a fixed sweep of 972 cases: nine sizes, none a whole number, by six
+overlaps, three of them not whole numbers. With this change: no chunk holds an unpaired surrogate, none is empty, the
+cases with an `overlap` of 0 all join back into the text, and in 436 of the 972 at least
+one character is in no chunk. Before it: 960 of the 972 held an unpaired surrogate, and
+in 589 at least one character was whole in no chunk. So at these settings the change
+removes the halves and does not make every character whole somewhere.
+
+That is recorded and left. The guarantees of this section are for `maxChars` and
+`overlap` that are whole numbers, and §9.42 says so. One rule that covers every setting
+was tried after this was found: a window never begins after the end of the chunk before
+it. It fixed the cases above, and a sweep then showed it emitting the same text twice at
+a room between one and two units, once a two-unit character had been taken. It is not
+built: each rule added for settings nobody chooses has brought a corner of its own, and
+the code that stands is right at every whole-number setting that was tried: the suite's
+own, a sweep of 3,200, and 60,000 random cases run in review.
+
+**Text that is already ill formed.** `chunkMarkdown` and `ingestDocuments` take any
+string. An unpaired surrogate that is already in the text is not inside a character as
+defined above, so no edge moves for it, and it stays in each chunk whose window covers
+it. The chunker does not repair text and does not refuse it. What it holds to: it adds
+none. A chunk holds an unpaired surrogate only where the text held that same one. The
+ingest script's own reader cannot bring one in from a file: it reads bytes that are not
+UTF-8 as U+FFFD (run: a file holding the bytes `ED A0 BD` was read as U+FFFD three times
+and stored).
+
+**What changes for a deployment.**
+
+1. A document with no window edge inside a character: nothing, at any setting that is a
+   number. The
+   chunks are the same bytes in the same order with the same indexes. Its stored content
+   hash still matches, so ingest skips it.
+2. A document that was cut, on Supabase stores: it could not be stored, and it has no
+   chunks to change. It is stored now. A document left with the `pending:` marker is
+   taken up by the next ingest run, because the marker is not its hash: nothing has to be
+   repaired by hand. Both were run: "How it was checked".
+3. A document that was cut, on a store that accepted the malformed chunk (the in-memory
+   store, or your own): the stored chunks stay as they are until the document's text
+   changes, because ingest skips a document whose hash matches. Read in the source, not
+   run.
+4. With an `overlap` of 0, the chunks after a moved edge begin one unit earlier than
+   before. With one unit of room, a character above U+FFFF is one chunk where it was two.
+
+**The exact change.**
+
+1. **`src/rag/chunk.ts`.** `windowText`, and one helper that says whether an edge is
+   inside a character. No other file under `src/`.
+2. **Tests** (§9.42, `test/chunk.test.ts`), seventy-three of them: 275 in 13 files, where
+   0.3.0 as published has 202.
+   - The test for "holds an unpaired surrogate" itself, on texts whose answer is known,
+     asked two ways: a walk over the units and the runtime's `isWellFormed`.
+   - The documents of the table above, each built from numbers so that no character
+     above U+007F is typed into the file. Eleven were cut before: no chunk of them holds
+     an unpaired surrogate now, and each chunk is the earlier chunk less the half at its
+     edge. Thirteen were not: their chunks are the bytes they were.
+   - Two sweeps of the table's rows: the emoji page with 0 to 1,265 letters in front,
+     and the Gothic words with 0 to 1,291. None is cut; the ones that were not cut
+     before (1,211 and 128) are the same bytes.
+   - A sweep of 3,200 documents: twenty settings by four heading lengths by five texts
+     by eight leading offsets. The settings include an `overlap` of 0, 1 and 2, an
+     `overlap` larger than the window, a negative one, and one, two and three units of
+     room. For each: every chunk well formed; the heading and the indexes as before; no
+     chunk longer than the room for it; where windows share text or leave gaps, each
+     chunk equal to the earlier chunk at that place less the halves at its edges; every
+     character whole in at least one chunk when `overlap` is 0 or more; with an `overlap`
+     of 0, the chunks joined give back the text. Of the 3,200, the earlier windowing cut
+     2,270 and did not cut 930, and those 930 chunk to exactly the bytes they did.
+   - What neighbours share at the defaults: 200 where no edge moved, 199 where one did,
+     198 where both did; a character one unit clear of an edge moves nothing.
+   - "The same bytes as before" has two anchors that do not depend on each other. A copy
+     of the earlier windowing is kept in the test file. And SHA-256 hashes of the chunks
+     of the twenty-four named documents, recorded by running the chunker before it was
+     changed, are literals in the test: the copy must reproduce all twenty-four, and the
+     chunker must reproduce the thirteen that were not cut.
+   - Text that is already ill formed, eleven cases: a high half alone and a low half
+     alone at an edge and one unit to either side of it, two halves the wrong way round
+     across an edge, two of the same kind across an edge. The chunks are exactly the
+     earlier windowing's. And beside a whole character that is moved off an edge, a
+     chunk holds the unpaired surrogate the text held there and no other.
+   - The same where windows share nothing, eight cases: with an `overlap` of 0 and with
+     one unit of room, text holding a half alone, or two the wrong way round, chunks
+     exactly as the earlier windowing chunked it.
+   - Sizes that are not whole numbers, five settings by five texts: no chunk is empty or
+     holds an unpaired surrogate, with an `overlap` of 0 the chunks join back, and a text
+     with nothing above U+FFFF chunks as before. The first build of this change gave an
+     empty chunk for U+1F600 and three letters at a `maxChars` of 1.5; a review found it,
+     and that case is a test.
+   - Windows that share nothing: with an `overlap` of 0, a chunk begins where the one
+     before it really ended; with one unit of room, a letter, U+1F600 and a letter give
+     three chunks, the middle one the whole character.
+   - The four characters at the corners of the two ranges of halves (U+10000, U+103FF,
+     U+10FC00, U+10FFFF), each across an end and across a start, so that each of the
+     helper's four limits is held by a test. A review found three of the four held by
+     none.
+   - A room just over one unit (a `maxChars` of 1 + 2^-40): each chunk is one whole
+     character. A guard that compared positions would not finish this test.
+   - Sizes that are not whole numbers, a sweep of 972 cases over texts whose characters
+     each occur once: no chunk is empty or holds an unpaired surrogate, an `overlap` of 0
+     joins back, and a text that was not cut before is the same bytes. It does not hold
+     that every character is whole in some chunk; that is for whole numbers ("Sizes that
+     are not whole numbers", above).
+   - Two headings: each section is windowed on its own and the indexes run on.
+   - Through `ingestDocuments` with the in-memory store, for two documents that were cut
+     before: no text handed to the embedding provider or to the store holds an unpaired
+     surrogate, and no chunk that retrieval returns does.
+3. **The words.** §9.7 and §9.42 here, the tests' line in §6, and one marker in §17. The
+   README: the two test counts, the row for `test/chunk.test.ts`, and a note under
+   "Operating it" that says what changed, what it was before and what was run.
+
+**How it was checked.** As §13 to §17.
+
+- Fresh copies: with `npm ci` and with `npm install`, the lockfile unchanged, typecheck,
+  275 of 275, build, audit at zero, format check.
+- Compiled `src`, comments stripped: 23 files, and against 0.3.0 as published
+  `rag/chunk.js` differs, and `config.js` by the version string, and nothing else.
+- Eighteen deliberate breaks, each applied to a copy, confirmed in the file and run
+  against the whole suite. In the final run each turned red exactly the tests named for
+  it and no others. Most of those sets were written down before the break was first run;
+  for four of the breaks a part of the set was written from a first run, after reading
+  why each test had failed.
+  No edge ever moves; a start does not move; an end does not. The helper looking at one
+  half only, the half before the edge or the one after it: the tests of text that is
+  already ill formed turn red. An end, and a start, moved when it lies just after a
+  whole character: documents that were not cut before change, and the recorded hashes
+  turn red. An end moved later, and a start moved earlier, each taking the whole
+  character: a chunk one unit too long. Windows that share nothing left where the
+  arithmetic put them. The one-unit window keeping half of the character. An empty
+  window emitted. The emptiness test of the first build. With one unit of room, any high
+  half taking two units. Each of the helper's four range limits moved in by one. Two more
+  breaks stop the loop from advancing, so a run of them never ends and no test turns red:
+  they are not among the eighteen. And one thing no test holds, because the suite has no
+  clock in it: how long the chunker takes. The first build crept at a room between one
+  and two units; that was timed outside the suite, before the fix and after it.
+- Outside the suite, offline: the documents of the table above through the changed
+  chunker. Every row that showed a chunk holding an unpaired surrogate shows none. The
+  emoji page over its 1,266 starting positions: 55 cut before, 0 now. The Gothic words
+  over 1,292 positions: 1,164 before, 0 now. One letter and 2,000 copies of U+1F600:
+  four edges moved, both pairs of neighbours share 198 units, and each of the 2,001
+  characters is whole in at least one chunk.
+- Outside the suite, on a Supabase stack of the versions above, started fresh. First the
+  chunker as it was, again: every result under "Measured first" came out the same. Then
+  with this change:
+  - a new document that was cut, in one chunk of three and in every chunk: stored, three
+    chunk rows, the content hash written, and a second ingest skipped;
+  - a stored page edited into one that was cut: stored over the old one, and the question
+    it answered still returns its three chunks;
+  - the folder of three files through the ingest script: exit code 0, all three stored,
+    and a second run skips all three;
+  - a folder the earlier code could not finish, with the second file left at its
+    `pending:` marker and the third never reached: the next run of the script with this
+    change skips the first file, stores the second and the third, and exits 0. The
+    stored chunks of the second file are the changed chunker's, byte for byte;
+  - the file holding a zero byte fails as before.
+
+That is one stack: PostgreSQL 17.11 behind PostgREST 16.4. The Voyage client was
+answered by a stand-in inside the process, as before.
+
+**Changed before release.** Four readings of this change found things. The first found
+that a `maxChars` that is not a whole number could give an empty chunk, and that text
+which is already ill formed was tested only where windows overlap. The second found the
+code correct at the sizes it tried, and three things beside it. Three of the helper's
+four range limits were held by no test: narrowing any one of them left the suite green.
+With windows that share nothing and a room between one and two units, the loop crept:
+200 copies of U+1F600 at a `maxChars` of 1.0000001 took over a minute. And five
+sentences of the README said more than had been run. The limits are tests now, with a
+break for each. The guard asks the slice and not two positions, so a pass always moves
+on by a whole unit: timed outside the suite, 50 copies took 17,222 ms before that and
+200 take under a millisecond after it. The README sentences say what was run. The third
+found what the second had missed by trying whole numbers only: at sizes that are not
+whole numbers a two-unit character on an edge can be in no chunk. That is measured and
+recorded under "Sizes that are not whole numbers", and it is left: this section's
+guarantees are for whole-number sizes. The fourth, of the release as rebuilt on
+0.3.0, found words and no code. A row of §9 still gave the version as 0.3.0. The
+upgrade note in the README and the paragraph on the version, below, said that a
+document left without chunks is stored by the next ingest run, where one folder had
+been run, and said nothing of a store that had accepted the malformed chunk. And this
+section named `npm run ingest` where the script had been run directly. Each says what
+was run now.
+
+**The version.** 0.3.1. A patch number: this is a fix, and no interface changes. Nothing
+has to be applied or migrated. What it means for documents that are already ingested is
+the list under "What changes for a deployment", above. Items 2 and 3 are the documents
+the earlier chunker cut: on Supabase stores, which was run, and on a store that accepted
+the malformed chunk, which was read and not run.
+
+**Not in this change.** Whether ingest checks a document before the embedding call: a
+file holding a zero byte still ends an ingest at the store, as measured (`22P05`).
+Whether one document that fails stops the rest of the folder. The order of the store's
+writes, delete before insert. No migration. Counting `maxChars` in characters, which
+would change what the setting means and every chunk of every document that holds an
+emoji. Signs made of several code points: a flag, an emoji with a skin tone or a joiner,
+a letter with a combining accent. The chunker can still put the parts of one in two
+chunks. Each part is well-formed text and is stored, and with an overlap wider than the
+sign it is whole in the neighbouring chunk. No embedding provider was called for this
+change.

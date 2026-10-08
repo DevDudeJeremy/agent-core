@@ -31,7 +31,7 @@ Needs npm and Node 22 (22.12 or newer), Node 24, or Node 26 and later. `.nvmrc` 
 ```bash
 npm ci          # or npm install: both leave package-lock.json untouched
 npm run check   # tsc --noEmit over src, tests, examples and scripts
-npm test        # 202 tests, with fetch replaced by a function that throws
+npm test        # 275 tests, with fetch replaced by a function that throws
 npm run build   # tsc -> dist/
 ```
 
@@ -217,7 +217,7 @@ test name points at a section of it.
 
 ## How the tests work
 
-`npm test` runs 202 tests in thirteen files and needs no network — and that isn't on the
+`npm test` runs 275 tests in thirteen files and needs no network — and that isn't on the
 honour system. [`test/setup.ts`](test/setup.ts) replaces the global `fetch` with a
 function that throws, so a test that reached for a paid service through `fetch` would
 fail instead of going online. (Four files swap in a stub of their own for some tests,
@@ -245,7 +245,7 @@ What each file checks:
 | `test/gates.test.ts` | A `human-approval` tool is never run, an `approval_required` event carries its input, and the model is told it is queued. |
 | `test/handoff.test.ts` | A `request_human_handoff` call logs `handoff_requested`, sets the conversation to `handed_off` and sends a `handoff` frame with the reason, checked on the loop's frames and on the wire; the turn still ends with `done`. With no such call, with a different tool running, or with invalid input, nothing is handed off. |
 | `test/retrieve.test.ts` | A vector-only match and a keyword-only match both surface; the fused scores match the RRF formula for known ranks; k = 60 and 12 candidates per channel are pinned as literals, in the memory store's results, and in the text of the SQL function in force, along with the one expression that reads the message (its cut at 10,000 characters and its rule for unbroken runs), `strip` on the stored side, the keyword order with its collation, and the majority comparison; the first migration file is byte-identical to its recorded hash, and no file defines the function twice; the reranker can reorder; `topK` holds; re-ingesting unchanged content makes no embedding call and no write; changed content replaces that document's chunks. |
-| `test/chunk.test.ts` | Chunking is deterministic, respects the size limit and the overlap, never crosses a heading, and prefixes each chunk with its heading path. |
+| `test/chunk.test.ts` | Chunking is deterministic, respects the size limit and the overlap, never crosses a heading, and prefixes each chunk with its heading path. No chunk holds half of a character above U+FFFF: on pages with emoji, on text in a script that lies above U+FFFF, and over 3,200 combinations of leading offset, heading length and chunk settings, no chunk holds an unpaired surrogate; in the 2,880 of them whose overlap is 0 or more, every character is whole in at least one chunk. The four characters at the corners of the two surrogate ranges are held too, each across the end of a chunk and across the start of the next. Where an edge moves off such a character, neighbours share one or two units fewer than the configured overlap. A document whose chunk edges miss every such character chunks to the same bytes as before the change: held against a copy of the earlier windowing kept in the test file, and that copy against hashes recorded from the chunker before it was changed. Text that already holds an unpaired surrogate is left as it is, where windows overlap and where they share nothing. At sizes that are not whole numbers, over 972 cases, no chunk is empty or holds an unpaired surrogate; that every character is whole in some chunk is held for whole-number sizes only. What ingest hands the embedding provider and the store for a document that used to be cut holds no unpaired surrogate. |
 | `test/prompt.test.ts` | The fixed guardrails always come first; business rules come after; the context block is marked untrusted and names its sources. |
 | `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`; the first `text` frame reaches the reader while the model is still mid-reply; `health` is readable from any origin while `chat` keeps the allowlist. A body in which `message`, `page`, `visitor.name` or `visitor.email` holds a NUL character or an unpaired surrogate gets a 400 that names the field and carries the CORS header, with no call to the conversation store, no event, no call to the `onEvent` hook and no model call; the same with the character first or last in the string, and the same when a `page`, a `visitor.name` or a `visitor.email` field like that is sent into a conversation that exists. A well-formed pair, written as two escapes or sent as UTF-8, is answered and stored as sent, and so is a body holding other control characters, noncharacters and U+FFFD in every field. A refused body counts against the rate limit; a message that is too long and also holds a NUL gets the answer a too-long one gets. |
 | `test/anthropic-client.test.ts` | `AnthropicModelClient` through the real SDK, against the documented stream: text deltas arrive in order; a tool call is put back together from its `input_json_delta` fragments; each stop reason maps; the request is the one the Messages API documents. Then the loop on top of it: a two-request tool round trip whose second request carries the `tool_result`; a tool call cut off by `max_tokens` is not run; an `error` event mid-stream and a refused key each end the turn with an `error` frame; and the first frame reaches the HTTP reader while the upstream response is still open. The SDK's own `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_CUSTOM_HEADERS` end up on the request, as the variables section says. |
@@ -353,6 +353,15 @@ project the agent will use, with the Supabase CLI or dashboard.
 The agent connects with the service-role key, so row-level security is enabled on every
 table with **no policies**: there is no anonymous or signed-in access path. The embedding
 dimension (1024) must match `EMBEDDING_DIM` in `src/rag/embed.ts`.
+
+**Upgrading from 0.3.0.** Nothing to apply: no migration. The chunker changed ("Operating
+it" says how, and what was run). A document the earlier chunker did not cut chunks to the
+same bytes as before. One it did cut, on a Supabase store: as run on one local stack,
+0.3.0 left it with no chunks, and the next run of the ingest script with this chunker
+stored it with nothing repaired by hand. On a store that accepted the malformed chunk (the
+in-memory store, or your own), the stored chunks stay as they are until the document's
+text changes. That case was read in the source and not run:
+[`docs/SPEC.md`](docs/SPEC.md) §18, "What changes for a deployment", item 3.
 
 **Upgrading from 0.2.0.** Nothing to apply: no migration, and nothing to ingest again.
 One thing changes on the wire. `POST {base}/chat` now answers `400 bad_request` for a
@@ -499,6 +508,28 @@ Worth knowing before it's in front of real visitors:
   - The check is on the request body and nothing else. `runTurn` called with no handler
     in front checks nothing, a model's reply and a tool's input are stored as they are,
     and the stores themselves are as they were.
+- A chunk never holds half of a character (since 0.3.1). Chunk sizes are counted in the
+  units of a JavaScript string, and a character above U+FFFF is two of them: U+1F600, an
+  emoji, for one. A chunk that would end or begin between the two stops before the
+  character or begins after it ([`test/chunk.test.ts`](test/chunk.test.ts)). Where that
+  happens, neighbouring chunks share 199 or 198 units at the default sizes, where they
+  share 200 elsewhere.
+  - What it was before. Run outside the suite on a Supabase stack (PostgreSQL 17.11): one
+    chunk holding an unpaired surrogate made the database refuse all of that document's
+    chunks (`invalid input syntax for type json`), after the store had deleted the ones it
+    had. The document was left with no chunks, and a second ingest of it failed the same
+    way. Run through the ingest script (`scripts/ingest.ts --dir`, its Voyage client
+    answered by a stand-in inside the process) on a folder of three files, twice: it
+    stopped at that file both times and never reached the file after it. It did not take
+    an unusual document: a page of thirty short paragraphs that each open with an emoji,
+    tried with 0 to 1,265 letters put in front of it, was cut at 55 of the 1,266.
+  - Run the same way on a stack of the same versions with this change: those documents
+    are stored, and a folder the earlier code left half-done is finished by the next run
+    of the script, with nothing repaired by hand.
+  - A document that was not cut chunks to the same bytes as before, so nothing stored
+    changes.
+  - A file holding a zero byte still fails an ingest at the store
+    (`unsupported Unicode escape sequence`). That is not changed.
 - A reply can come back empty. If the model runs out of `maxTokens` part-way through a
   tool call, the call is dropped, rightly, and the turn ends with `done` and no text. The
   `model_call` event for that turn says `stopReason: "max_tokens"`. If those show up,

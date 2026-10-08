@@ -1,6 +1,6 @@
 {
   "name": "@ddj/agent-core",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Reusable brain for DevDudeJeremy on-site agents: conversation loop, RAG, gated tools, guardrails, and a frozen HTTP/SSE contract. Portable, offline-verifiable ESM TypeScript.",
   "license": "MIT",

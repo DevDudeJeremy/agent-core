@@ -54,14 +54,50 @@ function splitSections(text: string): Section[] {
   return sections;
 }
 
-/** Slide a fixed-size window with a fixed overlap. Consecutive windows overlap by `overlap`. */
+/**
+ * True when `at` falls between the two units of one character above U+FFFF: a high half
+ * (U+D800 to U+DBFF) just before it and a low half (U+DC00 to U+DFFF) just after.
+ */
+function insideCharacter(s: string, at: number): boolean {
+  if (at <= 0 || at >= s.length) return false;
+  const before = s.charCodeAt(at - 1);
+  const after = s.charCodeAt(at);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+}
+
+/**
+ * Slide a fixed-size window with a fixed overlap, both counted in the units of a JavaScript
+ * string. A character above U+FFFF is two units, and an edge that would fall between the two
+ * moves one unit into its own window: an end one unit earlier, a start one unit later. So a
+ * window stops before such a character or begins after it and never holds half of one
+ * (SPEC §9.42). Consecutive windows share `overlap` units, less one for each of their two
+ * edges that moved. Text that already holds an unpaired surrogate is left as it is.
+ */
 function windowText(s: string, size: number, overlap: number): string[] {
   if (s.length <= size) return [s];
   const step = Math.max(1, size - overlap);
+  /** The windows share nothing, so no neighbour holds what one of them leaves out. */
+  const apart = step === size;
   const out: string[] = [];
-  for (let start = 0; start < s.length; start += step) {
-    out.push(s.slice(start, start + size));
-    if (start + size >= s.length) break;
+  for (let start = 0; start < s.length;) {
+    const end = Math.min(s.length, start + size);
+    const from = insideCharacter(s, start) ? start + 1 : start;
+    let to = insideCharacter(s, end) ? end - 1 : end;
+    // The slice is asked whether anything is left, not the two positions: a size that is
+    // not a whole number can put them a fraction apart over no text.
+    let piece = s.slice(from, to);
+    // Apart and nothing left: there was room for one unit and the character is two. The
+    // window takes the whole character, the one case where it is longer than `size`.
+    if (apart && !piece) {
+      to = from + 2;
+      piece = s.slice(from, to);
+    }
+    // Elsewhere a window with nothing left in it is not emitted.
+    if (piece) out.push(piece);
+    if (end >= s.length) break;
+    // Apart, the next window begins where this one really ended, so the character this one
+    // stopped before is the first of the next. Otherwise it begins where it always did.
+    start = apart ? to : start + step;
   }
   return out;
 }
