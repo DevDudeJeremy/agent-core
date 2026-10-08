@@ -1,6 +1,6 @@
 # agent-core — design spec
 
-**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15)
+**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15, §16)
 
 The design spec this package was built and reviewed against. `SPEC §n` in source comments
 and test names points at a section of this file. Edited for publication: references to
@@ -75,7 +75,7 @@ is testable in memory.**
 
 | Decision | Value |
 |---|---|
-| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.1.1` (was `0.1.0`; `fromEnv` gained an option, §15) |
+| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.2.0` (was `0.1.1`; retrieval results change and three behaviours are dropped, §16) |
 | Language | TypeScript `^5`, `strict: true`, build = `tsc` to `dist/`, `check` = `tsc --noEmit` |
 | Node | `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` in `engines` — the range vitest 5 declares — and `.nvmrc` = `22` (§12) |
 | Runtime deps | Exactly three: `@anthropic-ai/sdk`, `@supabase/supabase-js` (`^2.112.0`: the first release with both `db.retry` and `db.timeout`, which the store sets — §14), `zod` (v4 — use built-in `z.toJSONSchema()`) |
@@ -296,8 +296,11 @@ agent-core/
 │       └── ci.yml                 # the gate: install, check, test, build, format on three
 │                                  #   systems and two Node lines (§9.26)
 ├── supabase/
-│   └── migrations/
-│       └── 20260705000000_agent_core.sql   # §7 — file only, never applied from repo
+│   └── migrations/                # §7 — files only, never applied from repo
+│       ├── 20260705000000_agent_core.sql   # tables, indexes, RLS, the first function;
+│       │                          #   frozen: a test holds its SHA-256 (§16)
+│       └── 20261007000000_agent_core_keyword_majority.sql   # ddj_match_chunks, replaced:
+│                                  #   the keyword half's majority rule, and nothing else (§16)
 ├── src/
 │   ├── index.ts                   # public exports: defineAgent, fromEnv, createAgentHandler,
 │   │                              #   ingestDocuments, retrieve, EMBEDDING_DIM, built-in tools,
@@ -333,9 +336,11 @@ agent-core/
 │   ├── stores/
 │   │   ├── types.ts               # VectorStore, ConversationStore + shared row types
 │   │   ├── memory.ts              # createMemoryStores(): full in-memory implementations;
-│   │   │                          #   hybrid query = cosine + term-frequency → RRF(k=60);
-│   │   │                          #   same fusion arithmetic as the SQL function;
-│   │   │                          #   matching and tie order differ (2026-10-07, §11)
+│   │   │                          #   hybrid query = cosine + the majority rule → RRF(k=60);
+│   │   │                          #   same fusion arithmetic and admission rule as the SQL
+│   │   │                          #   function; no stemming, a plain count for ts_rank (§16)
+│   │   ├── english-stop-words.ts  # Postgres's 127 English stop words, for memory.ts; not
+│   │   │                          #   exported from index.ts (§16)
 │   │   └── supabase.ts            # createSupabaseStores(url, serviceKey): all three
 │   │                              #   interfaces over one client (sole supabase-js import);
 │   │                              #   query() calls RPC ddj_match_chunks
@@ -365,8 +370,9 @@ agent-core/
     ├── gates.test.ts              # gated tool NOT executed; approval event; model informed
     ├── handoff.test.ts            # escalation: event, handed_off status, SSE handoff frame (§9.15)
     ├── chunk.test.ts              # sizes, overlap, heading boundaries, breadcrumbs, determinism
-    ├── retrieve.test.ts           # hybrid ranking, RRF fusion math, pinned constants (§9.16),
-    │                              #   reranker hook, ingest idempotency
+    ├── retrieve.test.ts           # hybrid ranking, RRF fusion math, pinned constants and
+    │                              #   the frozen first migration (§9.16), reranker hook,
+    │                              #   ingest idempotency
     ├── prompt.test.ts             # non-negotiables always present/first, tone included, context block
     ├── handler.test.ts            # SSE order, CORS, 400/403/404/405/429/500, health, mid-stream
     │                              #   error, error-only stream when no conversation exists
@@ -374,8 +380,9 @@ agent-core/
     │                              #   stub (§9.19); no network, kill switch restored after
     ├── anthropic-client.test.ts   # AnthropicModelClient through the real SDK, against a
     │                              #   replay of the documented stream (§9.20, §9.21)
-    ├── postgres.test.ts           # the migration and ddj_match_chunks on real Postgres with
-    │                              #   pgvector, in-process (§9.22)
+    ├── postgres.test.ts           # the migrations and ddj_match_chunks on real Postgres with
+    │                              #   pgvector, in-process (§9.22); the keyword half's rule
+    │                              #   in both stores (§9.39)
     ├── new-agent.test.ts          # a config file plus a content folder → a grounded answer,
     │                              #   with no edit under src/ (§9.24); what the offline log
     │                              #   names (§9.30)
@@ -405,7 +412,9 @@ vars here — those belong to the site/widget side.
 
 ## 7. Persistence schema (SQL migration — file only)
 
-`supabase/migrations/20260705000000_agent_core.sql`, idempotent where possible
+Two files in `supabase/migrations/`, applied in name order (amended 2026-10-07, §16).
+The first, `20260705000000_agent_core.sql`, is frozen as published: §9.16 holds its
+SHA-256. It is idempotent where possible
 (`create extension if not exists vector`, `create table if not exists`). Header comment:
 embedding dimension 1024 must match `EMBEDDING_DIM` in `src/rag/embed.ts`. Tables (all
 `agent_`-prefixed, all with RLS **enabled and no policies** — service-role access only):
@@ -423,14 +432,22 @@ embedding dimension 1024 must match `EMBEDDING_DIM` in `src/rag/embed.ts`. Table
 - `agent_events` — id uuid pk, conversation_id uuid null, type text, payload jsonb,
   created_at. Index on (type, created_at).
 - Function `ddj_match_chunks(query_embedding vector(1024), query_text text,
-  match_count int)` → two CTEs (top 12 by cosine distance; top 12 by
-  `ts_rank` over `websearch_to_tsquery('english', query_text)`), full outer join,
-  **RRF with k = 60**, returns chunk id, content, source_id, title, url, rrf_score,
-  limit `match_count`.
+  match_count int)` → two CTEs, full outer join, **RRF with k = 60**, returns chunk id,
+  content, source_id, title, url, rrf_score, limit `match_count`. The vector half is the
+  top 12 by cosine distance. The keyword half, **as of §16 and the second file**
+  (`20261007000000_agent_core_keyword_majority.sql`, which holds this function and nothing
+  else): a passage is admitted when it holds more than half of the message's distinct
+  meaningful words; admitted passages are ordered by words held, then `ts_rank`, then
+  document order, and the first 12 go into the fusion (§16). It reads the first 10,000
+  characters of the message, less every unbroken run of 100 or more, and counts a stored
+  passage's words through `strip` (§16). The first file's definition
+  (top 12 by `ts_rank` over `websearch_to_tsquery('english', query_text)`, which needs
+  every word) is superseded by the second and is what running the first file again
+  restores.
 
 No npm script or source file executes any DDL, and nothing applies it to a live database.
 `createSupabaseStores` assumes the schema exists. One test (`test/postgres.test.ts`, §9.22)
-applies the file to a throwaway Postgres that lives inside the test process (amended
+applies every file to a throwaway Postgres that lives inside the test process (amended
 2026-10-07, §13).
 
 ## 8. Deriving a client agent
@@ -442,7 +459,7 @@ but the runtime (§4.4), and
 `npx tsx examples/node-server.ts --config agent.config.ts --content <folder>` serves it
 offline before any key exists (§13); (2) `cp .env.example .env`
 on the **deployment host** (client secrets never live in this repo); (3) apply the
-migration to the client's Supabase project; (4) drop the client's content into a
+migrations, in name order, to the client's Supabase project; (4) drop the client's content into a
 `knowledge/` folder and run the ingest CLI; (5) deploy behind their platform's adapter;
 (6) record model choice, hosting, and knowledge sources in the client's project docs. The
 widget side is then pointed at the agent's base URL (contract §1).
@@ -504,11 +521,13 @@ All commands from the copy's root.
     produces the exact expected `AgentEvent` sequence in the sink, each with
     `conversationId` and ISO timestamp; `onEvent` receives the same events; SSE `tool`
     frames contain name/status only — never tool inputs (assert).
-11. **Migration hygiene:** the migration file exists with pgvector extension, all five
+11. **Migration hygiene** (amended 2026-10-07, §16: "the migration file" is now the first
+    of two): the first migration file exists with pgvector extension, all five
     tables, both indexes, RLS enabled on every table, zero `create policy` statements,
-    and `ddj_match_chunks`; `grep -rn "20260705000000\|ddj_match_chunks" src/ scripts/
-    package.json` shows no code path that *executes* the file (the RPC name appearing in
-    `stores/supabase.ts` as a call target is expected). The one place the file is
+    and `ddj_match_chunks`; the second holds `ddj_match_chunks` and nothing else;
+    `grep -rn "20260705000000\|20261007000000\|ddj_match_chunks" src/ scripts/
+    package.json` shows no code path that *executes* a file (the RPC name appearing in
+    `stores/supabase.ts` as a call target is expected). The one place the files are
     executed is `test/postgres.test.ts`, against an in-process Postgres (§9.22).
 12. **Secrets hygiene:** `.env.example` lists exactly the §6.2 vars, all commented, no
     values; no string resembling a real key anywhere; `process.env` reads occur only
@@ -533,10 +552,19 @@ All commands from the copy's root.
     `RRF_K` is 60 and `RRF_CANDIDATES` is 12 — shows the memory store applying both (a
     rank-1 single-channel score of 1/61; each channel cut at 12, shown on twelve
     vector-only chunks, one chunk in both channels and thirteen keyword-only chunks), and
-    asserts that the migrations define `ddj_match_chunks` exactly once
-    and with the same two numbers. The SQL is read as text and never executed, so this
-    pins what the file says; §9.22 is where Postgres runs it. Changing either number in
-    either place fails the suite.
+    pins the SQL as text (amended 2026-10-07, §16; until then: "the migrations define
+    `ddj_match_chunks` exactly once"): every published migration file is byte-identical to
+    its recorded SHA-256; each file defines `ddj_match_chunks` at most once; and the
+    definition in the **last** file, in name order, shows the two cuts at 12, the two
+    k = 60 terms and the majority comparison `2 * … > …`; and how the message is read and
+    the passages ordered (§16): `query_text` named once in the body, inside
+    `left(query_text, 10000)`; `10000` once; the run pattern once, with its replacement
+    `' '` and its flag `'g'`; `to_tsvector('english',` and `plainto_tsquery('english',`
+    once each; `strip(` once, inside `ts_delete(`; and the keyword order written twice in
+    the same text, each time with `collate "C"` and `chunk_index`.
+    The SQL is read as text and never executed, so this
+    pins what the files say; §9.22 is where Postgres runs them. Changing either number in
+    either place, or one byte of a published file, fails the suite.
 17. **Formatting** (added 2026-10-07, §11): `npm run format:check` exits 0 on a fresh
     copy, so `npm run format` rewrites nothing.
 18. **Install safety** (added 2026-10-07, §12): on a fresh copy, `npm install` and
@@ -573,9 +601,10 @@ All commands from the copy's root.
 22. **The SQL on real Postgres** (added 2026-10-07, §13): `test/postgres.test.ts` applies
     every file in `supabase/migrations/` to an in-process Postgres with pgvector, twice,
     with no error. Against it: a vector-only and a keyword-only match both surface; fused
-    scores equal the RRF values for hand-set ranks; each channel is cut at 12; a
-    multi-word query follows `websearch_to_tsquery` (all words, stemmed, stop words
-    dropped, quoted phrases, `or`, `-`); a role without `BYPASSRLS` that holds every table
+    scores equal the RRF values for hand-set ranks; each channel is cut at 12; the
+    keyword half behaves as §9.39 says (amended 2026-10-07, §16; until then: "a multi-word
+    query follows `websearch_to_tsquery`: all words, stemmed, stop words dropped, quoted
+    phrases, `or`, `-`"); a role without `BYPASSRLS` that holds every table
     grant reads no row from any `agent_` table, gets no row from `ddj_match_chunks`, and
     cannot insert, while a `BYPASSRLS` role can; a wrong-dimension vector, a non-uuid
     `conversation_id` and a message for a missing conversation are rejected, and a NULL
@@ -632,7 +661,9 @@ All commands from the copy's root.
     either, a browser origin is refused on `chat`. A runtime part the file supplies is
     kept. A missing required variable throws an error that names it. `storeTimeoutMs`
     reaches the store: a request that never answers is abandoned at that deadline.
-33. **The keyword half on a full sentence** (added 2026-10-07, §14): with the shipped
+33. **The keyword half on a full sentence** (added 2026-10-07, §14; **superseded
+    2026-10-07 by §9.39**, KC-3, which changes the behaviour this criterion recorded; kept
+    as the record of 0.1.x): with the shipped
     example content on real Postgres, "Do you fix water heaters?" matches no chunk by
     keyword and "water heaters" matches one, and for the full question the function still
     returns the water-heater passage first, through the vector half. The README says so
@@ -643,8 +674,10 @@ All commands from the copy's root.
 35. **A message with no meaningful word** (added 2026-10-07, §15): on real Postgres, a
     message that is empty, blank, only stop words, only punctuation or a lone minus matches
     nothing by keyword and raises nothing; the vector half answers as if nothing was typed.
-36. **Version 0.1.1** (added 2026-10-07, §15): `package.json`, the lockfile's two root
-    entries, `VERSION` and `GET {base}/health` all say `0.1.1`.
+36. **Version** (added 2026-10-07, §15, as 0.1.1; **0.2.0 as of §16**): `package.json`,
+    the lockfile's two root entries, `VERSION` and `GET {base}/health` all say `0.2.0`.
+    A test holds `package.json` and both lockfile entries to `VERSION`, so one of them
+    left behind fails the suite.
 37. **A blank `AGENT_MODEL`** (added 2026-10-07, §15): empty or only spaces, as
     `.env.example` ships it, counts as unset: the file's model stands, or the default.
 38. **A key is needed only for what the environment builds** (added 2026-10-07, §15):
@@ -654,6 +687,165 @@ All commands from the copy's root.
     Any part it leaves out still needs its variable, and the error names it. When only
     some stores are supplied, each supplied store is the one used and only the missing
     ones come from Supabase. `fromEnv()` on its own still needs all four.
+39. **The keyword half of retrieval** (added 2026-10-07, §16). Twenty-six criteria, KC-1
+    to KC-26; test names carry the numbers. "Real Postgres" is the in-process database of
+    `test/postgres.test.ts` with every migration file applied: one server, PGlite 0.5.8,
+    which is PostgreSQL 18.3. Every expected value below was seen there. The messages of
+    KC-21 and the fixtures of KC-25 and KC-26 were also run outside the suite, on seven
+    PostgreSQL builds; §16 says which, and what came back.
+    In the fixtures, twelve
+    decoy passages near the query hold the whole vector half, so a passage that is not a
+    decoy and comes back came back by keyword, and its score, 1/(60 + rank), says where
+    the keyword half ranked it.
+    - **KC-1, more than half, and exactly half is not.** Passages `alpha beta gamma
+      delta`, `alpha beta gamma`, `alpha beta` and `alpha`. One word asked admits every
+      passage holding it; two need both; three need two; four need three; five need
+      three; six need four. A repeated word counts once. Stop words count on neither
+      side. The stand-in store returns the same rows with the same scores.
+    - **KC-2, order.** Words held, then `ts_rank`, then `source_id` in byte order, then
+      chunk. A passage holding three of the words once each ranks above one holding two
+      of them twenty times each, though the second has the higher `ts_rank`. Same in the
+      stand-in.
+    - **KC-3, four questions on the shipped content.** "Do you fix water heaters?", "What
+      time do you open on Saturday?" and "Is there a travel fee outside the county?" each
+      get exactly one keyword vote, for the passage that answers. "Can you repair my
+      boiler the same day?" gets exactly one too, for the water-heater passage; the
+      Heating and Emergencies passages get none.
+    - **KC-4, an exact term inside a sentence.** "Is 555-0100 the number to call at
+      night?": one vote, for the passage with the number. "Can I ring 555-0100 on a
+      Sunday?": none, because the best passage holds two of four words. "Is a heater
+      repair possible?": the water-heater passage, by stem.
+    - **KC-5, an exact term the vector half missed.** Four passages near the query
+      mention a tank; the one passage that names part AR-4420 is far from it. For "Do you
+      have the AR-4420 in stock for my tank?" with a limit of 4, the function returns the
+      part's passage among the four, at 1/61. The stand-in returns the same four. Control,
+      part of the criterion: with an any-word keyword half, and with the every-word one of
+      0.1.x, the same call returns the four tank passages and not the part.
+    - **KC-6, a paraphrase the vector half ranks first.** The passage that answers shares
+      no word with "What happens if I need to call it off last minute?" and is nearest the
+      query; four others each share a common word. With a limit of 4 it comes back first;
+      with a limit of 100 there are twelve rows, each scoring its vector share alone. Same
+      in the stand-in. Controls: with an any-word keyword half the four others come back
+      and the answer does not; with the every-word one of 0.1.x there are again twelve
+      rows, each at its vector share alone.
+    - **KC-7, nothing typed is syntax, and none of this raises.** Quotes, parentheses, `&`,
+      `|`, `!`, `:*`, `<->`, `<2>`, a backslash, a leading `-`, weights (`:A`),
+      text shaped like SQL, upper case, a hyphenated word, non-Latin and accented words,
+      an emoji, a URL, an e-mail address, and no message at all (NULL). A quoted phrase
+      does not need its words side by side, a leading minus does not exclude, `or` is a
+      stop word, and `:*` is not a prefix match.
+    - **KC-8, a message with no meaningful word.** §9.35, unchanged.
+    - **KC-9, length, and the first bound.** Only the first 10,000 characters of a
+      message are read. A word ending at character 10,000 counts; cut there, it does not
+      match; starting one character later, it is not read. The count is in characters: a
+      character above U+FFFF is one, though it is two units of a JavaScript string. About
+      2.6 MB of distinct words raises nothing, with a real word before or after it, and
+      one unbroken token of a million characters is skipped while the word beside it gets
+      its vote. Nine messages, each through both stores.
+    - **KC-10, two properties**, over 400 seeded messages and 40 passages built from
+      ordinary words, stop words, hyphenated words, part codes, a phone number, an e-mail
+      address, a URL, accented and non-Latin words and every operator character. The
+      messages also draw on words that are long, or that grow when lower-cased, under and
+      over the run bound. For each of the 16,000 pairs, counted outside the function: the
+      index probe finds a passage exactly when it holds at least one of the words, and
+      the function admits it exactly when it holds more than half. No mismatch and no
+      error; 947 pairs admitted; 111 of the 400 messages held a run of 100 or more. The
+      two properties are properties of a well-formed passage, so the test first asserts
+      that no passage here is one this server would index wrongly (KC-26 is where one
+      is). The cut at 12 decided in none of the 400 messages; KC-23 is where it does.
+    - **KC-11, the boiler question in the fusion.** The test places the six shipped
+      passages at vector ranks 1 to 6 by hand, Heating first and Water heaters second. For
+      "Can you repair my boiler the same day?" the function returns Water heaters
+      (1/61 + 1/62), Heating (1/61), Emergencies (1/63), Opening hours (1/64). Control:
+      the 0.1.x function on the same fixture returns Heating first and Water heaters
+      second, each at its vector share, because its keyword half says nothing.
+    - **KC-12, through the store.** `createSupabaseStores(...).vectorStore.query()` gets
+      the keyword vote for a full-sentence question when its one request is answered by
+      the real function, and the request still carries exactly `query_embedding`,
+      `query_text` and `match_count`.
+    - **KC-13, pins.** §9.16 as amended.
+    - **KC-14, migrations.** Both files apply in name order, twice. On a fresh database:
+      the first file alone gives no keyword vote for "Do you fix water heaters?"; the
+      second gives one; the first again gives none; one function throughout and every row
+      kept.
+    - **KC-15, the stand-in.** Its stop words are, as a set and in number (127), the ones
+      this server reads from its own `english.stop`; other Postgres versions were not
+      compared. KC-1, KC-2, KC-5 and KC-6 hold in it, and so do KC-9, KC-21, KC-23, KC-24
+      and KC-25, with the one difference KC-21 names. It keeps both bounds on the
+      message, counted by code point as Postgres counts them, and orders documents by
+      code point, which is byte order. One assertion holds the unit of its run bound:
+      `drain` glued to 60 characters above U+FFFF is 65 characters and 125 units of a
+      JavaScript string, and the stand-in reads it, where a count in units would skip it.
+      Each difference listed in §16 is asserted on a fixture where the two stores part.
+    - **KC-16, version.** §9.36.
+    - **KC-17, words.** The README says what §16 lists under "what the README says".
+      Read, not tested.
+    - **KC-18, nothing else moved.** The three tests that pinned the every-word behaviour
+      are the only existing tests replaced. Compiled with comments stripped, `src/`
+      differs from 0.1.1 in `config.js`, `stores/memory.js` and one new file.
+    - **KC-19, each test can fail.** Each of these breaks turns the named tests red: `>`
+      made `>=` in the SQL; the majority filter removed; the every-word keyword half put
+      back; `websearch_to_tsquery` in place of `plainto_tsquery`; raw text handed to
+      `to_tsquery`; words counted from the query's nodes instead of the distinct words;
+      `ts_rank` ahead of words held in the order; the document-order keys reversed; the
+      cap at 9,999 and at 10,001; the cap removed; the stand-in's stop list emptied; the
+      stand-in's `>` made `>=`; one byte changed in the first migration file. And, for
+      the criteria added below: the run bound removed; the bound on `to_tsvector` only,
+      and on `plainto_tsquery` only; `{100}` made `{101}` and `{99}`; only a space
+      breaking a run; `\S` in place of the four characters; the `g` flag removed; runs
+      removed before the cut at 10,000 and not after; `strip` removed; the cut at 12
+      ordered by `ts_rank` alone; `chunk_index` dropped from the order, and reversed;
+      `collate "C"` replaced by `collate "und-x-icu"`; `collate "C"` dropped (only the
+      text pin of §9.16 turns red: this server's own collation is already byte order);
+      and in the stand-in, the cut at 10,000 removed, the cut counted in UTF-16 units,
+      the run bound removed, `sourceId` compared with `<`, `chunkIndex` dropped from the
+      order, and the `u` flag off the run pattern, so that a run is counted in the units
+      of a JavaScript string.
+    - **KC-20, cost.** Measured once and recorded in §16. No timing assertion is in the
+      suite: a clock on a shared runner is not a gate.
+    - **KC-21, no word of a message can reach the limit on a word.** Decoys, a passage
+      `We fix a blocked drain.` and a passage of `drain` and 97 of `q`. Seventeen
+      messages, each through both stores, none raising. One unbroken word of 683 or of
+      1,023 of `Ⱥ` (U+023A), or 683 of `Ⱦ` (U+023E): no keyword row. `drain` beside 700
+      of them: both passages, because the run is skipped and one word is asked. `drain`
+      and 99 of `x`: none, two words asked. `drain` and 100 of `x`: both. A line feed, a
+      tab and a carriage return each break a run; a no-break space and a form feed do
+      not. The cut at 10,000 comes before the runs are removed, and counts characters.
+      The stand-in parts from Postgres on one message, `drain` and 99 of `Ⱥ`: its words
+      are ASCII letters and digits, so it asks one word where Postgres asks two.
+    - **KC-22, the sweep.** Every length from 1 to 1,100 of `Ⱥ` and of `Ⱦ`, alone and
+      after `drain`: 4,400 messages, asked inside the database. None raises. Alone, no
+      keyword row. After `drain`, none below 100 copies and both passages from 100 on.
+    - **KC-23, the cut at 12 keeps the twelve passages holding the most words.** Twelve
+      passages hold two of three words twenty times each, and one holds all three once
+      and has the lowest `ts_rank` of the thirteen. The one holding all three is first
+      and the twelfth of the others is left out. Both stores.
+    - **KC-24, the chunk key.** Three chunks of one document, stored last chunk first,
+      each holding both words once, come back in chunk order. Both stores.
+    - **KC-25, byte order.** Six documents whose ids differ in case, punctuation and
+      characters outside ASCII come back in byte order, in both stores. The test also
+      shows the fixture can tell the difference: under `collate "und-x-icu"` in the same
+      database the six come out in another order. This server's own collation is `C`, so
+      dropping the clause changes nothing here, and in the suite only the text pin of
+      §9.16 holds it. Outside the suite it is shown by behaviour (§16).
+    - **KC-26, a passage the server indexed wrongly does not stop the function
+      answering.** Postgres only, in a database of its own. A passage of `marker` and one
+      unbroken word of 683 of `Ⱥ`, and a passage `A marker by the drain.` First, that the
+      condition is there: `length(fts)` of the first passage is 2, so that if a server
+      ever drops the long word this test fails, says why, and does not pass quietly. Then
+      `marker` brings back fourteen rows with both passages by keyword, `marker drain`
+      brings back thirteen with the second, and a count of the table still answers 14.
+      The same fixture was run outside the suite on seven PostgreSQL builds (§16).
+40. **The boiler question on the path a reader can run** (added 2026-10-07, §16). The
+    shipped example content, embedded by the word-hash stand-in, with nothing set by hand.
+    For "Can you repair my boiler the same day?" at the default `topK` of 4, through
+    `retrieve()` on the stand-in store and through the SQL function on real Postgres: the
+    water-heater passage comes back first, with a score above 1/61 because it is in both
+    lists; the Heating passage, the one about boilers, is not among the four. In the
+    stand-in store it is not returned at all. The test asserts "not among the four" and no
+    rank: on Postgres the Heating passage ties with Opening hours at the bottom of the
+    vector half, and the order of those two is chance. KC-11 remains the fixture with the
+    vector ranks set by hand.
 
 ## 10. Out of scope (deliberate)
 
@@ -703,7 +895,9 @@ test executes supabase-js, so that move is unproven until the first live check.
    `websearch_to_tsquery` requires all of them; vector matches scoring zero or less are
    dropped, where the SQL keeps the 12 nearest whatever their distance; and ties are
    broken by chunk id, where the SQL has no tie-breaker. Ranking on real Postgres stays
-   on the README's list of live checks.
+   on the README's list of live checks. (**Replaced 2026-10-07, §16:** the stand-in now
+   applies the same admission rule and stop words as the SQL; its remaining differences
+   are listed in §16.)
 
 Each new test was shown to fail on a deliberate break of the thing it guards.
 
@@ -1022,3 +1216,330 @@ README's disclosure are unchanged.
 break of what it guards.
 
 **Not in this change.** The shape of the keyword query; anything else about ranking.
+
+## 16. Amendment — 2026-10-07, the keyword half of retrieval
+
+**Why.** §14 disclosed that the keyword half was silent on ordinary questions, and §15
+recorded an any-word replacement that was built and then held because it let a wrong
+passage outvote a right one. This is the design that came out of that, built as version
+0.2.0.
+
+**The rule.** The keyword half gives a passage a vote only when the passage holds more
+than half of the visitor's meaningful words. The message is read as plain words. Postgres
+drops the stop words and stems the rest, as it does for the stored passages. A passage
+qualifies when it holds a strict majority of the distinct words that are left. Qualifying
+passages are ordered by how many of the words they hold, then by `ts_rank`, then by
+document order, and the first 12 go into the fusion. The fusion is not changed: one SQL
+function, one round trip, 12 candidates per channel, Reciprocal Rank Fusion at k = 60,
+equal weights.
+
+**The reason is arithmetic.** With k = 60 and 12 candidates per channel, the worst a
+passage can score from being in both lists is 1/72 + 1/72 = 0.0278, and the best it can
+score from being in one is 1/61 = 0.0164. So every passage that is in both lists outranks
+every passage that is in only one, whatever the ranks. What a channel lets in matters more
+than how it orders what it lets in. Two things follow:
+
+- A keyword half that lets in every passage sharing any word turns the fusion into
+  "whatever is in both lists wins". A paraphrase the vector half ranks first is pushed out
+  of the passages the model reads by passages that share a common word (KC-6, control).
+  An exact term the vector half missed is pushed out the same way (KC-5, control), which
+  is the one case full-text is there to win.
+- A keyword half that lets in almost nothing, the every-word rule of 0.1.x, does no harm
+  and no good. It never finds the part number of KC-5 either.
+
+The majority rule sits between them on purpose. It speaks when its evidence singles out
+a few passages and stays silent when it does not. Silence is the 0.1.x behaviour, so the
+failure mode of this design is the thing that was already shipped. A strict majority
+rather than "at least half" is a judgment; no test here decides between the two.
+
+**The exact behaviour.**
+
+One expression reads the visitor's text in the function, and two more read its result:
+
+```sql
+regexp_replace(left(query_text, 10000), '[^ \t\n\r]{100}[^ \t\n\r]*', ' ', 'g')  -- read
+tsvector_to_array(to_tsvector('english', read))                                   -- words
+replace(plainto_tsquery('english', read)::text, ' & ', ' | ')::tsquery            -- any_word
+```
+
+`read` is the first 10,000 characters of the message, with every unbroken run of 100
+characters or more replaced by a space. A run is broken by a space, a tab, a line feed or
+a carriage return, and by nothing else. `words` is the message's distinct meaningful
+words, as data. `any_word` reaches candidate passages through the full-text index and is
+the query argument of `ts_rank`. For each candidate,
+`length(fts) - length(ts_delete(strip(fts), words))` is how many of the words it holds,
+and it is admitted when twice that is greater than `cardinality(words)`. The order is
+words held, `ts_rank`, `source_id collate "C"`, `chunk_index`, and the first 12 in that
+order are kept.
+
+- Stop words do not count on either side. Words match by stem. A word counts once.
+- One word asked: every passage holding it. Two: both. Three: two. Four: three. Five:
+  three. Six: four.
+- More of the words always ranks above fewer, however often the fewer are repeated.
+  `ts_rank` alone does not guarantee that.
+- Equal on both counts, the earlier document in byte order comes first, then the earlier
+  chunk. 0.1.x left that to chance.
+- A hyphenated word counts as Postgres splits it: "AR-4420" is `ar` and `-4420`,
+  "call-out" is `call-out` and `call`. A contraction leaves what Postgres leaves: "I'm"
+  adds `m`, "won't" adds `won`. Each raises the count of words asked.
+- A run of 100 or more is skipped, not cut: a cut run would leave a 99-character
+  fragment counted as a word asked. 100 is longer than a word, a part number, an order
+  number or an e-mail address a visitor types, and a SHA-256 in hexadecimal (64) passes.
+  A web address of 100 characters or more is skipped.
+- Ties in the fused score are still unordered, as before.
+
+**Safety.** Visitor text is never read as query syntax. `to_tsvector` parses a document
+and has no operators. `plainto_tsquery` recognises none either. The only text cast to
+`tsquery` is Postgres's own rendering of a query it built, whose lexemes it quotes and
+which contain no space, so replacing `' & '` cannot touch one. `ts_delete` and
+`cardinality` take the words as values. There is no dynamic SQL. Row-level security is
+untouched: the function still runs with the caller's rights.
+
+**What bounds a message, and where that has been run.** Postgres limits a word to 2,046
+bytes, measured after the word is lower-cased, and what a server does with a longer word
+depends on its version: drop it, raise, or keep a broken copy. A bound in characters on
+the whole message says nothing about one word. `Ⱥ` (U+023A) is 2 bytes and its lower case
+is 3, so a word of 683 of them is 1,366 bytes going in and 2,049 coming out. So the
+message is bounded twice, before anything parses it:
+
+- `left(…, 10000)` bounds the whole. Without it a message of a few megabytes raises
+  (`string is too long for tsvector` in this function; `value is too big in tsquery` in
+  0.1.x).
+- The run rule bounds each word. 99 characters are at most 1,188 bytes after
+  lower-casing. That figure is from the standards and not from a measurement:
+  lower-casing maps one character to at most three, and no character is over four bytes
+  in UTF-8.
+
+Inside the two bounds there is nothing for a message to raise on. That is the reasoning,
+and it is about the length of a word and nothing else: a message that is not a text
+value fails the turn before it reaches the function ("The limits", below). Where it has
+been run:
+
+- In the suite: PostgreSQL 18.3 in the test process (KC-9, KC-21, KC-22).
+- Outside the suite, on seven throwaway servers: PostgreSQL 15.14, 15.19, 16.10, 16.15,
+  17.6, 17.11 and 18.6. They are Debian builds with pgvector, database collation
+  `en_US.utf8`, libc provider: an earlier and a later build of 15, 16 and 17, and one
+  build of 18. On all seven the 17 messages of KC-21 come out as written there, and of
+  30,000 further messages none raises. Those are every length from 1 to 3,000 of five
+  letters (U+023A, U+023E, U+0130, U+1E9E, U+00DF), alone and after a word. One of the
+  30,000 is off the plain run rule on every server, and was expected to be: `drain` and
+  a single `İ` (U+0130), which lower-cases to `i`, a stop word, so one word is asked and
+  both passages come back.
+
+On a build that is not one of these it rests on the reasoning. The bound sits in front of
+the parser because the parser, the dictionaries and both value types each behave in their
+own way at the limit, and that behaviour is what differs between versions. The vector
+half is not bounded and does not need to be: the application makes the embedding from the
+whole message and the function receives a vector.
+
+**A known fault in 0.1.x.** Its keyword half has neither bound, and two kinds of message
+make it raise. A raise is one failed turn for the visitor who sent it. Retrieval runs
+after the conversation is loaded or created and the visitor's message stored, so those
+rows are written, with their `conversation_started` and `user_message` events. The raise
+then writes an `error` event and ends the stream with an `error` frame. No reply is
+stored and the model is not called.
+
+- A message of megabytes: `value is too big in tsquery`. The HTTP layer's limit of 2,000
+  keeps a visitor from it.
+- A message carrying one unbroken word of 683 to 1,023 of `Ⱥ` (U+023A) or `Ⱦ` (U+023E):
+  `word is too long in tsquery`. This one is inside the HTTP layer's limit. With 682 or
+  with 1,024 of them it does not raise.
+
+Both raise in the test database (PostgreSQL 18.3). The second was also run outside the
+suite, with the 0.1.x function on the seven servers above. It raises on PostgreSQL 15.14,
+16.10 and 17.6: on each, 6 of the 17 messages of KC-21 and 1,364 of the 30,000. It does
+not raise on 15.19, 16.15, 17.11 or 18.6: none of the 17 and none of the 30,000 on each.
+Outside the suite that is two builds of each of 15, 16 and 17, where the earlier one
+raises and the later one does not, and one build of 18. Builds between those were not
+run. 0.2.0 is the fix. There is no patch for 0.1.x, because the fix is the second
+migration, and going back to the first file restores the fault.
+
+**A stored passage is not bounded.** The first migration builds `fts` from a passage as
+it is. In the test database a passage holding `marker` and one unbroken word of 683 of
+`Ⱥ` is stored without error, and wrongly: `fts` holds two words, the one that should be
+the long word is a single byte, and reading `fts::text` on that row raises `invalid byte
+sequence for encoding "UTF8"`. `ts_delete` rebuilds a stored value together with its
+positions. Handed that value directly, the function brought back no row and no error for
+a message sharing a word with the passage, and the database raised an internal error on
+the statements tried after it. `strip` copies the words and never reads the positions,
+and with it the function answers and the database goes on answering (KC-26).
+
+The same passage was run outside the suite, on the seven servers above. PostgreSQL 15.14,
+16.10 and 17.6 keep a copy of the long word in the passage's index entry, as the test
+database does; 15.19, 16.15, 17.11 and 18.6 drop it. With the count taken without
+`strip`, as this function was first built, a message sharing a word with the passage
+ended the backend on the three that keep the copy: the connection was closed and the
+server went into recovery. On the four that drop the word nothing happened. That build
+was never published. With `strip`, the function as it stands answers that message on all
+seven (the plain passage first, the long-word passage second, fourteen rows), then
+answers `marker drain` with the plain passage, and the table still answers. The 0.1.x
+function also answers that message on all seven, and no backend ends.
+
+That is all `strip` is shown to do. It does not make the passage right. It is not a
+visitor's doing: a visitor cannot put a passage in, and no real document holds such a
+word. Closing it at its source means bounding what is indexed, which is a larger change
+than this one and is not in it.
+
+**A second migration file, not an edit.** The change ships as
+`20261007000000_agent_core_keyword_majority.sql`, holding a header comment and one
+`create or replace function`. `20260705000000_agent_core.sql` is not edited, and §9.16 now
+holds its SHA-256. §15 recorded an earlier judgment that editing the first file in place
+was acceptable because nothing had applied it. That is not knowable of a public
+repository: a migration tool that tracks files by name would never run an edited file
+again and would leave such a database on the old function with no error. The cost is that
+the folder holds a superseded definition in its first file; the second file's header says
+so.
+
+**What an upgrader is told** (the README carries this):
+
+1. Apply the new file. A fresh install applies every file in name order. No table, column
+   or index changes and nothing is ingested again.
+2. A full-sentence question can now get a keyword match: more than half of the words,
+   where 0.1.x needed all of them.
+3. Three things stop working: a quoted phrase no longer has to appear as a phrase, a
+   leading minus no longer excludes a word, and `or` no longer means "either".
+4. Going back: run the first file again. That restores the 0.1.x function and touches no
+   row (KC-14). It also restores the fault in 0.1.x described above, and the README says
+   so in the same place.
+5. What the keyword half reads of a message is bounded twice, with the servers it has
+   been run on named, and the fault in 0.1.x that the second file fixes.
+
+**The stand-in store** (`src/stores/memory.ts`) repeats the admission rule, with
+Postgres's 127 English stop words in `src/stores/english-stop-words.ts`. Words asked are
+its own tokens (runs of letters and digits) without stop words, de-duplicated; a passage
+is admitted when it holds more than half; the order is words held, total occurrences,
+`sourceId` by code point, `chunkIndex`. It keeps both bounds on the message, the cut at
+10,000 counted by code point and the run rule, so its tests read the text the function
+reads. Those are kept, not listed as differences. It still differs from Postgres in five
+ways of behaviour, each asserted where the two part:
+
+| Difference | Shown by |
+| --- | --- |
+| No stemming | "Is a heater repair possible?" on the shipped content: Postgres admits the water-heater passage; the stand-in admits nothing, because the passage says "heaters". |
+| Order among equals is a plain count, not `ts_rank` | "alpha beta gamma" against `alpha alpha alpha alpha beta` and `alpha alpha beta beta`: Postgres puts the even one first, the stand-in the lopsided one. |
+| Tokens are letters and digits only | `heater@water.example` is one word to Postgres and three to the stand-in, which then admits two passages Postgres does not. |
+| The vector side drops matches at or below zero | The three-chunk example of §9.22. |
+| Ties in the fused score go by chunk id | KC-5 in the stand-in; Postgres leaves them unordered. |
+
+One more difference lies outside retrieval, and no test asserts it: the in-memory stores
+accept a message holding a NUL character or an unpaired surrogate, which a database
+behind Supabase refuses ("The limits", below). The header of `src/stores/memory.ts`
+lists the five and then this one, apart from them.
+
+With the stand-in, nothing about stemming is proven, nothing about how a server indexes
+a stored passage, and nothing about what a database refuses to store. A keyword match
+that depends on a plural or a tense is only ever exercised on real Postgres.
+
+**The limits.** Recorded so nobody rediscovers them:
+
+- It is silent whenever no passage holds more than half of the words. On a long, chatty
+  message that is the usual case, and the vector half decides alone.
+- Exactly half is not a majority. "Can I ring 555-0100 on a Sunday?" asks four words, the
+  passage with the number holds two, and it gets no vote (KC-4).
+- A long message that carries one exact code gets no keyword vote for it: the passage
+  with the code holds a small share of the words.
+- Every meaningful word counts the same. "Do you fix water heaters?" and "Can you repair
+  my boiler the same day?" look alike to any rule that counts words: the water-heater
+  passage holds two of the three words in both. So the boiler question's vote goes to the
+  wrong passage (KC-3). On this content the Heating passage then never outranks that
+  passage, whatever the vector half does, because that passage is in both lists and the
+  Heating passage is in one at most and sometimes in none. Whether the Heating passage
+  is among the four the model reads depends entirely on the vector half. In KC-11 the
+  test sets the vector ranks by hand with Heating first, and there both are in the four;
+  the same test runs the 0.1.x function on that fixture, which returns Heating first
+  because its keyword half says nothing, and this design gives that up knowingly. With
+  the word-hash stand-in for embeddings, which does not stem, "boiler" shares nothing
+  with "boilers", and the Heating passage is not in the four; the stand-in store does
+  not return it at all (§9.40). With a real embedding model this has not been measured.
+  Weighting words by how rare they are would not separate the two on this content:
+  "repair" and "boiler" are each in exactly one passage.
+- The `english` configuration is fixed in the schema. Content that is not English is
+  outside what this was built for; that limit is older than this change.
+- A pasted address, key or blob of 100 characters or more is skipped by the keyword half,
+  not searched. The vector half still reads it.
+- A message that is not a text value never reaches the function. A NUL character, or an
+  unpaired surrogate arriving as JSON, is refused by the database before retrieval, and
+  the turn fails when it stores the message. Measured outside the suite, through the
+  HTTP handler on a Supabase stack running PostgreSQL 17.11, with the function as it
+  stands: `POST {base}/chat` with the body `{"message":"a\u0000b"}`, and with
+  `{"message":"a\ud800b"}`, each answers HTTP 200 with two frames, `meta` then `error`
+  (`server_error`, "Something went wrong handling this message."). The conversation is
+  opened, storing the message is what fails, and the model is not called. An ordinary
+  message on that stack gets `meta`, `text`, `done`. With the in-memory stores the same
+  two bodies get `meta`, `text`, `done`: the stand-in accepts them, so the suite cannot
+  show this. The handler does not refuse such a message itself; whether it should, with
+  a 400, is a change to the HTTP contract and is not in this one. It is the store and
+  not the keyword half, and the store's code has not changed since 0.1.x; 0.1.x itself
+  was not run for it. It is recorded so that nobody reads the section above as "a
+  visitor's message cannot fail the turn".
+
+**What has been measured, and what has not.** In the suite, on one server, PostgreSQL
+18.3 in the test process: everything in §9.39. Stems come from the stemmer a server
+ships, and a server's version can change one; the stems in §9.39 are that server's.
+
+Outside the suite, with throwaway servers and a harness that is not part of this
+repository:
+
+- On PostgreSQL 15.14, 15.19, 16.10, 16.15, 17.6, 17.11 and 18.6: the 17 messages of
+  KC-21 and the 30,000 above, none raising; the stored passage of KC-26, answered on all
+  seven; and the six documents of KC-25. Those servers' own collation is `en_US.utf8`.
+  With the clause `collate "C"` the six come back in byte order on all seven, and with
+  it removed they come back in the server's order. So the clause is shown by behaviour
+  there, and not only by the text pin.
+- Through PostgREST, on a Supabase stack running PostgreSQL 17.11, with both files
+  applied by the Supabase CLI: 20 of 20 checks, one of which compares the
+  function with a second implementation of the rule on 300 random messages.
+- Through the HTTP handler on such a stack: the two bodies of "The limits" above, a NUL
+  character and an unpaired surrogate, each of which fails the turn at the store.
+
+Not measured: a Supabase project's own build; anything with Voyage embeddings or a
+Claude answer; a real business's content; real customers' phrasing; what a reranker in
+the hook does to the trade. The README's list of live checks says so.
+
+**Cost.** One `ts_delete` per candidate passage on top of the index probe. Measured once,
+on the function as first built, before the run bound and `strip` were added, and not
+measured again since. It was run in the test database (WebAssembly, so slower than a
+server) on 20,000 synthetic passages of about 1,400 characters, keyword half only, median
+of five runs: about 0.16 s for an eight-word question, about 0.32 s for three words that
+every passage holds, and 1.65 s for a message cut at 10,000 characters. On 5,000
+passages: 0.04 s, 0.08 s and 0.43 s. A business's content is usually tens to a few
+thousand passages; past the low tens of thousands, measure before relying on it.
+
+**What the README says.** The rule in the terms above. That full-text finds an exact
+term the vectors blur only under that rule, with the test that shows it. That the keyword
+half is often silent, and why it is that strict. That every word counts the same, with
+the boiler question as the worked example. That exactly half is not enough and the count
+follows Postgres's splitting. That quotes, a minus and `or` are no longer operators. What
+is and is not measured. What the stand-in repeats and what it does not. How to upgrade
+and how to go back. The two bounds on a message, and that a pasted run of 100 or more is
+skipped. The servers it has been run on, by name, in the suite and outside it. The
+fault in 0.1.x, beside the upgrade note and again beside going back. The limit on a
+stored passage. That a message holding a NUL or an unpaired surrogate fails the turn at
+the store, and that the in-memory stores accept it. It does not say that answers are better or retrieval more accurate, and
+it does not say of any message that it cannot raise without saying where that was run.
+
+**`src/` changes in three files:** `stores/memory.ts`, the new
+`stores/english-stop-words.ts`, and the version in `config.ts`. `src/stores/supabase.ts`,
+`src/rag/retrieve.ts`, the `VectorStore` interface, the wire contract, the tables and the
+indexes do not change.
+
+**Changed before release.** As first built, the function read `left(query_text, 10000)`
+and nothing more, and this section said that no message could make the keyword half
+raise. A review before release found one that did: the word of 683 to 1,023 of `Ⱥ`
+above. The same review found the stand-in reading the whole message where Postgres read
+10,000 characters, and three parts of the keyword order that no test held (the order
+feeding the cut at 12, the chunk key, the collation). 0.2.0 had not been published, so
+the second migration file was edited and no third file was added. The run rule, `strip`,
+the stand-in's bounds, KC-21 to KC-26, and the sentences here and in the README that name
+a server all come from that.
+
+**How it was checked.** As §13 to §15, plus KC-19: each break in that list was applied to
+a copy, confirmed in the file, and seen to turn the named tests red, and where a break
+should leave a test alone, it did (`strip` removed changes no row of KC-21). One note
+from that run: with the cap removed, the long message of KC-9 raises `string is too long
+for tsvector`, from the expression that reads the words, before `plainto_tsquery` can
+raise its own error.
+
+**Not in this change.** Any weighting of words; phrase search as an option; a relevance
+floor on the vector half; an order for ties in the fused score; a stemmer in the
+stand-in; content that is not English; the reranker.

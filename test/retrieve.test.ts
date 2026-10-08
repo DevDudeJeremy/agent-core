@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import {
@@ -121,20 +122,39 @@ describe('RRF constants are pinned (SPEC §9.16)', () => {
     expect(scores['k10#0']).toBeCloseTo(1 / 72, 12);
   });
 
-  it('the SQL function ddj_match_chunks hard-codes the same two numbers', () => {
-    // Read as text, so this pins what the file says. test/postgres.test.ts is where the
-    // migration is executed and the two cuts and the fusion are checked on real Postgres.
+  it('published migrations are frozen, and the function in force holds the same numbers and the majority rule', () => {
+    // Read as text, so this pins what the files say. test/postgres.test.ts is where the
+    // migrations are executed and the cuts, the fusion and the rule are checked on Postgres.
     const dir = new URL('../supabase/migrations/', import.meta.url);
-    const sql = readdirSync(dir)
+    const files = readdirSync(dir)
       .filter((f) => f.endsWith('.sql'))
-      .sort()
-      .map((f) => readFileSync(new URL(f, dir), 'utf8'))
-      .join('\n')
-      .replace(/--.*$/gm, ''); // comments are not SQL
-    // Exactly one definition across every migration: a later file cannot quietly replace it.
+      .sort();
+
+    // A published file is never edited. Someone may have applied it, and a migration tool
+    // that tracks files by name would not run an edited one again. A change is a new file,
+    // and its hash joins this list in the commit that publishes it.
+    const PUBLISHED: Record<string, string> = {
+      '20260705000000_agent_core.sql':
+        '653d2858de75addeb1d8f490a0357aa525fff3b736539856c49afecffb38a47b',
+    };
+    for (const [name, sha256] of Object.entries(PUBLISHED)) {
+      expect(files).toContain(name);
+      const bytes = readFileSync(new URL(name, dir));
+      expect(createHash('sha256').update(bytes).digest('hex'), name).toBe(sha256);
+    }
+
+    // At most one definition per file, and the one in force is the one in the last file
+    // that has one: files are applied in name order and each is `create or replace`.
     const marker = 'function ddj_match_chunks';
-    expect(sql.split(marker)).toHaveLength(2);
-    const body = sql.slice(sql.indexOf(marker));
+    const sqlOf = (file: string): string =>
+      readFileSync(new URL(file, dir), 'utf8').replace(/--.*$/gm, ''); // comments are not SQL
+    for (const file of files) {
+      expect(sqlOf(file).split(marker).length - 1, file).toBeLessThanOrEqual(1);
+    }
+    const defining = files.filter((file) => sqlOf(file).includes(marker));
+    expect(defining).toEqual(files); // today: both files define it, the second in force
+    const inForce = sqlOf(defining.at(-1)!);
+    const body = inForce.slice(inForce.indexOf(marker));
 
     // Candidates per channel: each CTE ends `limit <n> )`. The final `limit match_count` is
     // not a number, so it is not one of these.
@@ -146,6 +166,43 @@ describe('RRF constants are pinned (SPEC §9.16)', () => {
       Number(m[1]),
     );
     expect(ks).toEqual([60, 60]);
+
+    // How the message is read: once, and through both bounds before anything parses it.
+    // `query_text` is named twice, as the parameter and inside the one `left`.
+    expect(body.match(/\bquery_text\b/g)).toHaveLength(2);
+    expect(body.match(/\b10000\b/g)).toHaveLength(1);
+    // The first 10,000 characters, and nothing in an unbroken run of 100 or more: the run
+    // pattern once, as the pattern of a regexp_replace whose replacement is one space and
+    // whose flag is `g`.
+    const RUN = String.raw`'[^ \t\n\r]{100}[^ \t\n\r]*'`;
+    expect(body.split(RUN)).toHaveLength(2);
+    expect(body.replace(/\s+/g, ' ')).toContain(
+      `regexp_replace( left(query_text, 10000), ${RUN}, ' ', 'g' )`,
+    );
+    // The two parsers read that result, once each.
+    expect(body.split("to_tsvector('english',")).toHaveLength(2);
+    expect(body.split("plainto_tsquery('english',")).toHaveLength(2);
+    // A stored passage is counted through strip, once, inside ts_delete.
+    expect(body.split('strip(')).toHaveLength(2);
+    expect(body).toContain('ts_delete(strip(');
+
+    // The keyword order is written twice, for the rank and before the cut at 12, and both
+    // times in the same text. This is the only thing in the suite that holds `collate "C"`:
+    // this database's own collation is already byte order, so no behaviour here needs it.
+    const orders = [...body.matchAll(/order by\s+(k\.words_held[^;]*?k\.chunk_index asc)/g)].map(
+      (m) => m[1]!.replace(/\s+/g, ' '),
+    );
+    expect(orders).toEqual([
+      'k.words_held desc, ts_rank(k.fts, k.any_word) desc, k.source_id collate "C" asc, k.chunk_index asc',
+      'k.words_held desc, ts_rank(k.fts, k.any_word) desc, k.source_id collate "C" asc, k.chunk_index asc',
+    ]);
+    expect(body.match(/\border by\b/g)).toHaveLength(5); // the vector half twice, these two, the fusion
+
+    // The majority rule: twice the words held, strictly more than the words asked.
+    const majority = [...body.matchAll(/\b2\s*\*\s*([\w.]+)\s*(>=?)\s*([\w.]+)/g)];
+    expect(majority.map((m) => [m[1], m[2], m[3]])).toEqual([
+      ['k.words_held', '>', 'k.words_asked'],
+    ]);
   });
 });
 

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
+import { VERSION } from '../src/index.js';
 
 interface LockEntry {
   peer?: boolean;
@@ -12,10 +13,12 @@ const readJson = (name: string): unknown =>
   JSON.parse(readFileSync(new URL(`../${name}`, import.meta.url), 'utf8'));
 
 const pkg = readJson('package.json') as {
+  version: string;
   dependencies: Record<string, string>;
   devDependencies: Record<string, string>;
 };
 const lock = readJson('package-lock.json') as {
+  version: string;
   packages: Record<string, LockEntry & { version?: string }>;
 };
 const names = Object.keys(lock.packages)
@@ -89,5 +92,22 @@ describe('the declared supabase-js range has the options the store sets (SPEC §
     expect(Number(floor![1])).toBeGreaterThanOrEqual(112);
     // And what is locked is what the suite was run against.
     expect(lock.packages['node_modules/@supabase/supabase-js']!.version).toBe('2.117.3');
+  });
+});
+
+// The health endpoint answers with VERSION, and the health test holds that. Nothing held the
+// other three places to it, so one of them left behind at a release would go unnoticed.
+describe('the version is the same everywhere it is written (SPEC §9.36)', () => {
+  it('package.json and both root entries of the lockfile say what VERSION says', () => {
+    expect(VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    expect({
+      'package.json': pkg.version,
+      'package-lock.json': lock.version,
+      'package-lock.json, packages[""]': lock.packages['']!.version,
+    }).toEqual({
+      'package.json': VERSION,
+      'package-lock.json': VERSION,
+      'package-lock.json, packages[""]': VERSION,
+    });
   });
 });

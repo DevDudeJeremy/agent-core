@@ -1,18 +1,47 @@
 /**
  * Full in-memory implementations of the stores — the substrate for tests, local dev, and
- * the offline demo. The vector store's hybrid `query()` uses the SQL function's fusion
- * ARITHMETIC — top-12 per channel, Reciprocal Rank Fusion at k=60, both pinned by a test —
- * and only APPROXIMATES everything else. Known differences (not a complete list):
- *  - no stemming or stop-word removal (Postgres `to_tsvector('english', …)` does both);
- *  - a multi-word query matches a chunk containing ANY of its words, where
- *    `websearch_to_tsquery` requires all of them;
- *  - full-text rank is a raw term count standing in for `ts_rank`;
+ * the offline demo. The vector store's hybrid `query()` repeats three things the SQL function
+ * `ddj_match_chunks` does, and approximates the rest.
+ *
+ * The same as the SQL:
+ *  - the fusion ARITHMETIC: top 12 per channel, Reciprocal Rank Fusion at k=60, equal
+ *    weights, both numbers pinned by a test;
+ *  - the keyword half's ADMISSION RULE: a chunk gets a keyword vote only when it holds more
+ *    than half of the message's distinct words, after Postgres's own 127 English stop words
+ *    are dropped (english-stop-words.ts). Admitted chunks are ordered by how many of the
+ *    words they hold, then by how often, then by document and chunk;
+ *  - the keyword half's BOUNDS, kept and not approximated: it reads the first 10,000
+ *    characters of a message, and nothing in an unbroken run of 100 or more (a run is broken
+ *    by a space, a tab, a line feed or a carriage return). Characters are counted the way
+ *    Postgres counts them, by code point, not by the UTF-16 units of a JavaScript string;
+ *    and documents are ordered by `sourceId` in code-point order, which is the byte order
+ *    the SQL's `collate "C"` gives.
+ *
+ * Where it differs from Postgres. Five differences of behaviour, and none of bounds:
+ *  - no stemming: "heater" does not find "heaters" here, and "refunds" does not find
+ *    "Refund". Postgres finds both;
+ *  - order among chunks holding the same number of the words is a plain count of
+ *    occurrences, where Postgres uses `ts_rank`. They can disagree: for "alpha beta gamma",
+ *    `alpha alpha alpha alpha beta` (5) comes before `alpha alpha beta beta` (4) here, and
+ *    after it in Postgres;
+ *  - a token is a run of ASCII letters and digits, nothing else. Postgres splits hyphens,
+ *    signs, e-mail addresses, URLs and non-ASCII letters its own way, which can change how
+ *    many words a message asks. "AR-4420" is `ar` and `4420` here; in Postgres it is `ar`
+ *    and `-4420`. And 99 non-ASCII letters are a word asked to Postgres and nothing here;
  *  - vector matches scoring zero or less are dropped, where the SQL keeps the 12 nearest
  *    whatever their distance;
- *  - ties are broken by chunk id here; the SQL has no tie-breaker, so equal-ranked rows
- *    come back in whatever order Postgres picks.
- * test/postgres.test.ts runs the same fixtures through this store and through the SQL on a
- * real Postgres, and asserts each of these differences.
+ *  - ties in the fused score are broken by chunk id here; the SQL leaves them unordered.
+ *
+ * One more difference, outside retrieval, which no test asserts: these stores accept a
+ * message holding a NUL character or an unpaired surrogate. A database behind Supabase
+ * does not, and there such a message fails the turn when it is stored.
+ *
+ * What this stand-in cannot prove: NOTHING ABOUT STEMMING, nothing about how a server
+ * indexes a stored passage (its tokens never grow when folded, so it cannot show a passage
+ * word a server indexes wrongly), and nothing about what a database refuses to store. A
+ * keyword match that depends on a plural or a tense is only ever exercised by
+ * test/postgres.test.ts, which runs the same fixtures through this store and through the
+ * SQL on a real Postgres and asserts each of the five differences above.
  */
 import type {
   Conversation,
@@ -25,6 +54,7 @@ import type {
 } from './types.js';
 import { RRF_CANDIDATES, RRF_K } from '../rag/retrieve.js';
 import { tokenize } from '../rag/embed.js';
+import { ENGLISH_STOP_WORDS } from './english-stop-words.js';
 
 interface MemChunk {
   id: string;
@@ -57,15 +87,59 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-/** Term-frequency proxy for Postgres `ts_rank`: total occurrences of query terms. */
-function ftsScore(content: string, terms: string[]): number {
-  if (terms.length === 0) return 0;
-  const wanted = new Set(terms);
-  let score = 0;
+/**
+ * What a chunk holds of the words a message asks: how many distinct ones (`held`), and how
+ * often in all (`occurrences`, the stand-in for Postgres `ts_rank`).
+ */
+function keywordCounts(
+  content: string,
+  asked: ReadonlySet<string>,
+): { held: number; occurrences: number } {
+  const held = new Set<string>();
+  let occurrences = 0;
   for (const tok of tokenize(content)) {
-    if (wanted.has(tok)) score++;
+    if (asked.has(tok)) {
+      held.add(tok);
+      occurrences++;
+    }
   }
-  return score;
+  return { held: held.size, occurrences };
+}
+
+/**
+ * Code-point order, which is the byte order of UTF-8 and so what the SQL's `collate "C"`
+ * gives. Plain `<` compares UTF-16 units and parts from it above U+FFFF; `localeCompare`
+ * parts from it at the first capital letter.
+ */
+function byCodePoint(a: string, b: string): number {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  for (let i = 0; i < x.length && i < y.length; i++) {
+    const difference = x[i]!.codePointAt(0)! - y[i]!.codePointAt(0)!;
+    if (difference !== 0) return difference;
+  }
+  return x.length - y.length;
+}
+
+/** How much of a message the keyword half reads, and the longest unbroken run it reads. */
+const KEYWORD_MAX_CHARACTERS = 10_000;
+const UNBROKEN_RUN = /[^ \t\n\r]{100}[^ \t\n\r]*/gu;
+
+/**
+ * What the keyword half reads of a message, as the SQL reads it: the first 10,000
+ * characters, then every unbroken run of 100 or more replaced by a space. The cut comes
+ * first. Both numbers count code points: a character above U+FFFF is one character, though
+ * it is two units of a JavaScript string.
+ */
+function keywordText(message: string): string {
+  let read = '';
+  let characters = 0;
+  for (const character of message) {
+    if (characters === KEYWORD_MAX_CHARACTERS) break;
+    read += character;
+    characters++;
+  }
+  return read.replace(UNBROKEN_RUN, ' ');
 }
 
 interface Ranked {
@@ -109,17 +183,28 @@ class MemoryVectorStore implements VectorStore {
         .filter((r) => r.score > 0),
     ).slice(0, RRF_CANDIDATES);
 
-    // Channel 2: full-text (term frequency), top RRF_CANDIDATES.
-    const terms = tokenize(q.text);
-    const fts = sortRanked(
-      all
-        .map((chunk) => ({ chunk, score: ftsScore(chunk.content, terms) }))
-        .filter((r) => r.score > 0),
-    ).slice(0, RRF_CANDIDATES);
+    // Channel 2: keyword. The words asked are the distinct words of what the keyword half
+    // reads of the message, without stop words. A chunk is admitted only when it holds more
+    // than half of them; nothing is admitted when nothing is asked. Order: words held,
+    // occurrences, document, chunk.
+    const asked = new Set(
+      tokenize(keywordText(q.text)).filter((word) => !ENGLISH_STOP_WORDS.has(word)),
+    );
+    const keyword = all
+      .map((chunk) => ({ chunk, ...keywordCounts(chunk.content, asked) }))
+      .filter((k) => 2 * k.held > asked.size)
+      .sort(
+        (a, b) =>
+          b.held - a.held ||
+          b.occurrences - a.occurrences ||
+          byCodePoint(a.chunk.sourceId, b.chunk.sourceId) ||
+          a.chunk.chunkIndex - b.chunk.chunkIndex,
+      )
+      .slice(0, RRF_CANDIDATES);
 
     // Reciprocal Rank Fusion (k = RRF_K).
     const fused = new Map<string, { chunk: MemChunk; score: number }>();
-    const fuse = (list: Ranked[]): void => {
+    const fuse = (list: { chunk: MemChunk }[]): void => {
       list.forEach((item, i) => {
         const rank = i + 1;
         const contribution = 1 / (RRF_K + rank);
@@ -129,7 +214,7 @@ class MemoryVectorStore implements VectorStore {
       });
     };
     fuse(vector);
-    fuse(fts);
+    fuse(keyword);
 
     return sortRanked([...fused.values()].map((f) => ({ chunk: f.chunk, score: f.score })))
       .slice(0, q.limit)

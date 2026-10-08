@@ -56,7 +56,7 @@ describe('HTTP contract fidelity (SPEC §9.9, docs/http-contract.md)', () => {
     const handler = makeHandler(new MockModelClient([]));
     const res = await handler(new Request('http://host/agent/health'));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, version: '0.1.1', protocolVersion: 1 });
+    expect(await res.json()).toEqual({ ok: true, version: '0.2.0', protocolVersion: 1 });
   });
 
   it('health is readable from any origin; chat keeps the allowlist (SPEC §9.28)', async () => {
