@@ -6,7 +6,7 @@ import {
   MemoryEventSink,
   FeatureHashEmbeddings,
 } from '../src/index.js';
-import type { ConversationStore, ModelClient, ModelEvent } from '../src/index.js';
+import type { AgentEvent, ConversationStore, ModelClient, ModelEvent } from '../src/index.js';
 import { MockModelClient, textDelta, stop } from '../src/testing/mock-model.js';
 import { parseSSE, readSSE, textReader } from './harness.js';
 
@@ -18,6 +18,8 @@ function makeHandler(
     rateMax?: number;
     clientKey?: (req: Request) => string;
     conversations?: ConversationStore;
+    events?: MemoryEventSink;
+    onEvent?: (e: AgentEvent) => void;
   } = {},
 ): (req: Request) => Promise<Response> {
   const { vectorStore, conversations } = createMemoryStores();
@@ -30,12 +32,13 @@ function makeHandler(
       rateLimit: { windowMs: 60_000, max: opts.rateMax ?? 100 },
       clientKey: opts.clientKey,
     },
+    onEvent: opts.onEvent,
     runtime: {
       modelClient: model,
       embeddings: new FeatureHashEmbeddings(),
       vectorStore,
       conversations: opts.conversations ?? conversations,
-      events: new MemoryEventSink(),
+      events: opts.events ?? new MemoryEventSink(),
     },
   });
   return createAgentHandler(agent);
@@ -56,7 +59,7 @@ describe('HTTP contract fidelity (SPEC §9.9, docs/http-contract.md)', () => {
     const handler = makeHandler(new MockModelClient([]));
     const res = await handler(new Request('http://host/agent/health'));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, version: '0.2.0', protocolVersion: 1 });
+    expect(await res.json()).toEqual({ ok: true, version: '0.3.0', protocolVersion: 1 });
   });
 
   it('health is readable from any origin; chat keeps the allowlist (SPEC §9.28)', async () => {
@@ -240,5 +243,201 @@ describe('HTTP contract fidelity (SPEC §9.9, docs/http-contract.md)', () => {
     const frames = await readSSE(res);
     expect(frames.map((f) => f.event)).toEqual(['error']);
     expect((frames[0]!.data as { code: string }).code).toBe('server_error');
+  });
+});
+
+describe('text in the body that Postgres cannot store (SPEC §9.41)', () => {
+  /** The in-memory conversation store, writing down the name of every call made to it. */
+  function recordingStore(): {
+    store: ConversationStore;
+    inner: ConversationStore;
+    calls: string[];
+  } {
+    const inner = createMemoryStores().conversations;
+    const calls: string[] = [];
+    const store: ConversationStore = {
+      create(meta) {
+        calls.push('create');
+        return inner.create(meta);
+      },
+      get(id) {
+        calls.push('get');
+        return inner.get(id);
+      },
+      appendMessage(id, msg) {
+        calls.push('appendMessage');
+        return inner.appendMessage(id, msg);
+      },
+      listMessages(id, limit) {
+        calls.push('listMessages');
+        return inner.listMessages(id, limit);
+      },
+      setStatus(id, status) {
+        calls.push('setStatus');
+        return inner.setStatus(id, status);
+      },
+    };
+    return { store, inner, calls };
+  }
+
+  const conversationIdOf = (frames: Array<{ data: unknown }>): string =>
+    (frames[0]!.data as { conversationId: string }).conversationId;
+
+  // [the field, what it holds, the body exactly as it goes on the wire]. Each is valid JSON:
+  // the character is written as an escape, which is the only way it reaches a string.
+  const REFUSED: Array<[string, string, string]> = [
+    ['message', 'a NUL', '{"message":"a\\u0000b"}'],
+    ['message', 'an unpaired high surrogate', '{"message":"a\\ud800b"}'],
+    ['message', 'an unpaired low surrogate', '{"message":"a\\udc00b"}'],
+    ['message', 'a pair the wrong way round', '{"message":"a\\ude00\\ud83db"}'],
+    ['message', 'an unpaired high surrogate at the end', '{"message":"ab\\ud83d"}'],
+    ['message', 'an unpaired low surrogate at the start', '{"message":"\\ude00ab"}'],
+    ['message', 'a NUL at the end', '{"message":"ab\\u0000"}'],
+    ['page', 'a NUL', '{"message":"hi","page":"/a\\u0000b"}'],
+    ['page', 'an unpaired surrogate', '{"message":"hi","page":"/a\\ud800b"}'],
+    ['visitor.name', 'a NUL', '{"message":"hi","visitor":{"name":"a\\u0000b"}}'],
+    ['visitor.name', 'an unpaired surrogate', '{"message":"hi","visitor":{"name":"a\\ud800b"}}'],
+    ['visitor.email', 'a NUL', '{"message":"hi","visitor":{"email":"a\\u0000b@x.example"}}'],
+    [
+      'visitor.email',
+      'an unpaired surrogate',
+      '{"message":"hi","visitor":{"email":"a\\ud800b@x.example"}}',
+    ],
+  ];
+
+  it.each(REFUSED)(
+    '%s holding %s → 400 bad_request, and nothing is touched',
+    async (field, _what, body) => {
+      const model = new MockModelClient([[textDelta('never'), stop('end_turn')]]);
+      const { store, calls } = recordingStore();
+      const events = new MemoryEventSink();
+      const heard: AgentEvent[] = [];
+      const onEvent = (e: AgentEvent): void => {
+        heard.push(e);
+      };
+      const handler = makeHandler(model, { conversations: store, events, onEvent });
+      const res = await handler(chatReq(body));
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('content-type')).toBe('application/json');
+      expect(res.headers.get('access-control-allow-origin')).toBe(ORIGIN);
+      const { error } = await errBody(res);
+      expect(error.code).toBe('bad_request');
+      expect(error.message).toContain(`The ${field} field`);
+      // No conversation loaded or created, nothing stored, nothing logged, the hook not
+      // called, no model call.
+      expect(calls).toEqual([]);
+      expect(events.events).toEqual([]);
+      expect(heard).toEqual([]);
+      expect(model.calls).toEqual([]);
+    },
+  );
+
+  it('a well-formed pair written as two escapes is text: answered, and stored as sent', async () => {
+    const model = new MockModelClient([[textDelta('ok'), stop('end_turn')]]);
+    const { store, inner, calls } = recordingStore();
+    const res = await makeHandler(model, { conversations: store })(
+      chatReq('{"message":"a\\ud83d\\ude00b"}'),
+    );
+
+    expect(res.status).toBe(200);
+    const frames = await readSSE(res);
+    expect(frames.map((f) => f.event)).toEqual(['meta', 'text', 'done']);
+    const stored = await inner.listMessages(conversationIdOf(frames), 10);
+    expect(stored[0]).toMatchObject({ role: 'user', content: 'a\u{1F600}b' });
+    // The store that stayed untouched above is one that does record a turn.
+    expect(calls).toEqual(expect.arrayContaining(['create', 'appendMessage']));
+  });
+
+  it('characters above U+FFFF are text in every field, sent as UTF-8', async () => {
+    const body = {
+      message: 'Is \u{1D49C} open? \u{1F600} \u{20BB7}',
+      page: '/menu/\u{1F600}',
+      visitor: { name: 'Ada \u{1F600}', email: '\u{1D49C}@x.example' },
+    };
+    const model = new MockModelClient([[textDelta('ok'), stop('end_turn')]]);
+    const { store, inner } = recordingStore();
+    const res = await makeHandler(model, { conversations: store })(chatReq(body));
+
+    expect(res.status).toBe(200);
+    const frames = await readSSE(res);
+    expect(frames.map((f) => f.event)).toEqual(['meta', 'text', 'done']);
+    const id = conversationIdOf(frames);
+    expect(await inner.get(id)).toMatchObject({ page: body.page, visitor: body.visitor });
+    expect((await inner.listMessages(id, 10))[0]!.content).toBe(body.message);
+    expect(model.calls[0]!.messages.at(-1)).toEqual({ role: 'user', content: body.message });
+  });
+
+  it('every other character is text: control characters, noncharacters and U+FFFD are answered', async () => {
+    // A line feed, a tab, three more control characters, the replacement character, two
+    // noncharacters and the last code point. None is U+0000 and none is a surrogate.
+    const odd = '\n\t\u0001\u001F\u007F\uFFFD\uFFFE\uFFFF\u{10FFFF}';
+    const body = {
+      message: `line one${odd}line two`,
+      page: `/p${odd}`,
+      visitor: { name: `Ada${odd}`, email: `a${odd}@x.example` },
+    };
+    const model = new MockModelClient([[textDelta('ok'), stop('end_turn')]]);
+    const { store, inner } = recordingStore();
+    const res = await makeHandler(model, { conversations: store })(chatReq(body));
+
+    expect(res.status).toBe(200);
+    const frames = await readSSE(res);
+    expect(frames.map((f) => f.event)).toEqual(['meta', 'text', 'done']);
+    const id = conversationIdOf(frames);
+    expect(await inner.get(id)).toMatchObject({ page: body.page, visitor: body.visitor });
+    expect((await inner.listMessages(id, 10))[0]!.content).toBe(body.message);
+  });
+
+  // [the field, the rest of the body]. These fields are written only when a conversation is
+  // created, so 0.2.0 answered each of these.
+  it.each([
+    ['page', '"page":"/a\\u0000b"'],
+    ['visitor.name', '"visitor":{"name":"a\\ud800b"}'],
+    ['visitor.email', '"visitor":{"email":"a\\u0000b@x.example"}'],
+  ])(
+    '%s holding one, sent into a conversation that exists → 400, and nothing is added to it',
+    async (field, rest) => {
+      const model = new MockModelClient([[textDelta('ok'), stop('end_turn')]], {
+        repeatLast: true,
+      });
+      const { store, inner, calls } = recordingStore();
+      const handler = makeHandler(model, { conversations: store });
+      const conversationId = conversationIdOf(
+        await readSSE(await handler(chatReq({ message: 'hi' }))),
+      );
+      calls.length = 0;
+
+      const res = await handler(
+        chatReq(`{"message":"again","conversationId":"${conversationId}",${rest}}`),
+      );
+
+      expect(res.status).toBe(400);
+      expect((await errBody(res)).error.message).toContain(`The ${field} field`);
+      expect(calls).toEqual([]);
+      expect(model.calls).toHaveLength(1);
+      const stored = await inner.listMessages(conversationId, 10);
+      expect(stored.map((m) => m.content)).toEqual(['hi', 'ok']);
+    },
+  );
+
+  it('a refused body counts against the rate limit, as an oversized one does', async () => {
+    const handler = makeHandler(new MockModelClient([]), { rateMax: 1 });
+    const headers = { 'x-forwarded-for': '7.7.7.7' };
+
+    const refused = await handler(chatReq('{"message":"a\\u0000b"}', headers));
+    expect(refused.status).toBe(400);
+
+    const next = await handler(chatReq({ message: 'hi' }, headers));
+    expect(next.status).toBe(429);
+  });
+
+  it('a message that is too long and also holds a NUL gets the answer a too-long one gets', async () => {
+    const handler = makeHandler(new MockModelClient([]));
+    const tooLong = await handler(chatReq({ message: 'x'.repeat(2001) }));
+    const both = await handler(chatReq({ message: 'x'.repeat(2001) + '\u0000' }));
+
+    expect(both.status).toBe(400);
+    expect(await errBody(both)).toEqual(await errBody(tooLong));
   });
 });

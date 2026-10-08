@@ -32,9 +32,11 @@
  *    whatever their distance;
  *  - ties in the fused score are broken by chunk id here; the SQL leaves them unordered.
  *
- * One more difference, outside retrieval, which no test asserts: these stores accept a
- * message holding a NUL character or an unpaired surrogate. A database behind Supabase
- * does not, and there such a message fails the turn when it is stored.
+ * One more difference, outside retrieval, which no test asserts: these stores accept text
+ * holding a NUL character or an unpaired surrogate. A database behind Supabase does not.
+ * The HTTP handler refuses a request body holding either before any store is called
+ * (SPEC §9.41). It checks nothing else: a model's reply and a tool's input reach these
+ * stores as they are.
  *
  * What this stand-in cannot prove: NOTHING ABOUT STEMMING, nothing about how a server
  * indexes a stored passage (its tokens never grow when folded, so it cannot show a passage

@@ -31,7 +31,7 @@ Needs npm and Node 22 (22.12 or newer), Node 24, or Node 26 and later. `.nvmrc` 
 ```bash
 npm ci          # or npm install: both leave package-lock.json untouched
 npm run check   # tsc --noEmit over src, tests, examples and scripts
-npm test        # 180 tests, with fetch replaced by a function that throws
+npm test        # 201 tests, with fetch replaced by a function that throws
 npm run build   # tsc -> dist/
 ```
 
@@ -217,7 +217,7 @@ test name points at a section of it.
 
 ## How the tests work
 
-`npm test` runs 180 tests in thirteen files and needs no network — and that isn't on the
+`npm test` runs 201 tests in thirteen files and needs no network — and that isn't on the
 honour system. [`test/setup.ts`](test/setup.ts) replaces the global `fetch` with a
 function that throws, so a test that reached for a paid service through `fetch` would
 fail instead of going online. (Four files swap in a stub of their own for some tests,
@@ -233,7 +233,7 @@ what each one **cannot** prove:
 | A replay of Anthropic's documented stream, through the real SDK | The Anthropic API | That the live service sends this today, or accepts these requests. The stream is written out from the published streaming reference, event for event. It is not a recording of a call. |
 | A stand-in that only quotes (`examples/offline-runtime.ts`) | Claude, in the config demo and its test | That a model answers well from a passage. It shows the right passage came back, and nothing about language. |
 | `FeatureHashEmbeddings` (deterministic word hashing) | Voyage embeddings | Retrieval quality. It proves the pipeline and the fusion arithmetic, not that the best passage ranks first on real text. `VoyageEmbeddings` itself is typechecked and never called. |
-| Memory stores | Supabase (pgvector + Postgres) | Anything about stemming, how Postgres ranks, how a server indexes a stored passage, or what the database refuses: the memory stores accept a message holding a NUL character or an unpaired surrogate, and through Supabase that message fails the turn. The memory store repeats the fusion arithmetic, the keyword half's majority rule, Postgres's own stop words and both bounds on what is read of a message. It does not stem, and among passages holding the same words it orders by a plain count where Postgres uses `ts_rank`. One test runs the same fixtures through both and asserts where they part ways. |
+| Memory stores | Supabase (pgvector + Postgres) | Anything about stemming, how Postgres ranks, how a server indexes a stored passage, or what the database refuses: the memory stores accept text holding a NUL character or an unpaired surrogate, and a database behind Supabase does not. The handler refuses a request body holding either before any store is called. That is the request body and nothing else: a model's reply and a tool's input are stored as they are. The memory store repeats the fusion arithmetic, the keyword half's majority rule, Postgres's own stop words and both bounds on what is read of a message. It does not stem, and among passages holding the same words it orders by a plain count where Postgres uses `ts_rank`. One test runs the same fixtures through both and asserts where they part ways. |
 | PGlite (Postgres with pgvector, compiled to WebAssembly, in the test process) | A Supabase project's database | Anything about Supabase's own layer. The SQL is really executed, but there is no PostgREST in front of it, the roles are made by the test to stand for Supabase's, and the Postgres version is PGlite's, 18.3, which is one server and not the one a project runs. |
 | A recording `fetch` stub with canned replies | The Supabase HTTP API | That PostgREST accepts the requests. It proves the order and bodies of what supabase-js sends for `upsertDocument`, `appendMessage` and the event sink, and that a store which is down is tried once and given up on by a deadline. One call, `ddj_match_chunks`, is answered by the real function instead of a canned reply. |
 
@@ -247,7 +247,7 @@ What each file checks:
 | `test/retrieve.test.ts` | A vector-only match and a keyword-only match both surface; the fused scores match the RRF formula for known ranks; k = 60 and 12 candidates per channel are pinned as literals, in the memory store's results, and in the text of the SQL function in force, along with the one expression that reads the message (its cut at 10,000 characters and its rule for unbroken runs), `strip` on the stored side, the keyword order with its collation, and the majority comparison; the first migration file is byte-identical to its recorded hash, and no file defines the function twice; the reranker can reorder; `topK` holds; re-ingesting unchanged content makes no embedding call and no write; changed content replaces that document's chunks. |
 | `test/chunk.test.ts` | Chunking is deterministic, respects the size limit and the overlap, never crosses a heading, and prefixes each chunk with its heading path. |
 | `test/prompt.test.ts` | The fixed guardrails always come first; business rules come after; the context block is marked untrusted and names its sources. |
-| `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`; the first `text` frame reaches the reader while the model is still mid-reply; `health` is readable from any origin while `chat` keeps the allowlist. |
+| `test/handler.test.ts` | The HTTP contract: frame order, response headers, and 400 / 403 / 404 / 405 / 429 / 500 responses; a failure mid-stream ends with an `error` frame; a store that is down before a conversation exists gives a stream whose only frame is `error`; the first `text` frame reaches the reader while the model is still mid-reply; `health` is readable from any origin while `chat` keeps the allowlist. A body in which `message`, `page`, `visitor.name` or `visitor.email` holds a NUL character or an unpaired surrogate gets a 400 that names the field and carries the CORS header, with no call to the conversation store, no event, no call to the `onEvent` hook and no model call; the same with the character first or last in the string, and the same when a `page`, a `visitor.name` or a `visitor.email` field like that is sent into a conversation that exists. A well-formed pair, written as two escapes or sent as UTF-8, is answered and stored as sent, and so is a body holding other control characters, noncharacters and U+FFFD in every field. A refused body counts against the rate limit; a message that is too long and also holds a NUL gets the answer a too-long one gets. |
 | `test/anthropic-client.test.ts` | `AnthropicModelClient` through the real SDK, against the documented stream: text deltas arrive in order; a tool call is put back together from its `input_json_delta` fragments; each stop reason maps; the request is the one the Messages API documents. Then the loop on top of it: a two-request tool round trip whose second request carries the `tool_result`; a tool call cut off by `max_tokens` is not run; an `error` event mid-stream and a refused key each end the turn with an `error` frame; and the first frame reaches the HTTP reader while the upstream response is still open. The SDK's own `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_CUSTOM_HEADERS` end up on the request, as the variables section says. |
 | `test/postgres.test.ts` | On Postgres with pgvector, one server (PGlite, PostgreSQL 18.3): both migrations apply in name order, twice; a vector-only and a keyword-only match both surface with the RRF scores for hand-set ranks; each channel is cut at 12, and the keyword cut keeps the twelve passages holding the most words. The keyword half: a passage holding more than half of the words gets a vote and one holding exactly half does not; the order is words held, then rank, then document in byte order, then chunk; a part number the vector half missed is among the four passages returned, and a paraphrase the vector half ranks first is not outvoted, each with the two earlier rules run on the same fixture as a control; nothing typed is read as search syntax. A message is read through two bounds, its first 10,000 characters and nothing in an unbroken run of 100 or more, and none of the messages tried raises: megabytes of text, and every length from 1 to 1,100 of a letter that grows when lower-cased, alone and after a word. A passage the server indexed wrongly does not stop the function answering. Over 16,000 seeded message-and-passage pairs the function admits exactly the passages that a count made outside it says hold more than half; a message with no meaningful word matches nothing. Upgrading applies the second file, and running the first again goes back. A role that may not bypass row-level security reads and writes nothing, and one that may does both; the constraints the stores lean on hold. The same fixtures run through the memory store, and each difference is asserted, down to its stop-word list against Postgres's own; the memory store counts an unbroken run in characters, not in the units of a JavaScript string. On the shipped example content, three full-sentence questions and one with a phone number in it each get one keyword vote, for the passage that answers; the boiler question's vote goes to the water-heater passage, and with the vector ranks set by hand that lifts it over the boiler passage, where the 0.1.x function on the same fixture puts the boiler passage first. With the word-hash stand-in for embeddings and nothing set by hand, that question brings back the water-heater passage first and not the boiler passage, in both stores. |
 | `test/new-agent.test.ts` | A config file and a content folder that the test writes become an agent that answers from that folder, as that business, on the path its config names; the shipped example stands up the same way beside it and neither sees the other's content; a config can bring its own model. Offline, the event log names the stand-in that answered, never a Claude model, and the no-config demo's reply is the one the quick start shows. |
@@ -354,6 +354,13 @@ The agent connects with the service-role key, so row-level security is enabled o
 table with **no policies**: there is no anonymous or signed-in access path. The embedding
 dimension (1024) must match `EMBEDDING_DIM` in `src/rag/embed.ts`.
 
+**Upgrading from 0.2.0.** Nothing to apply: no migration, and nothing to ingest again.
+One thing changes on the wire. `POST {base}/chat` now answers `400 bad_request` for a
+body in which `message`, `page`, `visitor.name` or `visitor.email` holds a NUL character
+or an unpaired surrogate. 0.2.0 accepted such a body, and "Operating it" says what each
+one got. The 400 has the shape of the one a message that is too long already gets, and
+[`docs/http-contract.md`](docs/http-contract.md) lists the case.
+
 **Upgrading from 0.1.x.** Apply the second file. What changes: a full-sentence question
 can now get a keyword match, because a passage needs more than half of the message's
 meaningful words where 0.1.x needed every one. What stops working: in 0.1.x a quoted
@@ -366,9 +373,10 @@ The second file also bounds what the keyword half reads of a message, twice: the
 broken by a space, a tab, a line feed or a carriage return. Inside those bounds no word
 comes within reach of Postgres's limit on the length of a word (2,046 bytes, counted
 after the word is lower-cased), so there is nothing for a message to raise on. That
-sentence is about the length of a word and nothing else: a message can still fail a turn
-for another reason, and "Operating it" has one (a NUL character or an unpaired
-surrogate). It is the reasoning, and it has been run. In the suite: on PostgreSQL 18.3,
+sentence is about the length of a word and nothing else. (The one other kind of message
+known to fail a turn held a NUL character or an unpaired surrogate, and from 0.3.0 the
+handler refuses it before a turn starts: see "Operating it".) It is the reasoning, and
+it has been run. In the suite: on PostgreSQL 18.3,
 the suite's own database. Outside the suite, on throwaway servers: on PostgreSQL 15.14,
 15.19, 16.10, 16.15, 17.6, 17.11 and 18.6 (Debian builds with pgvector). On each of the
 seven, the suite's seventeen boundary messages gave the answers they give in the suite,
@@ -459,15 +467,38 @@ Worth knowing before it's in front of real visitors:
     project's own build; retrieval quality with Voyage embeddings, with a Claude answer,
     on a real business's content, or on real customers' phrasing. A first deployment
     owes those checks (see the live checks above).
-- A message holding a NUL character or an unpaired surrogate fails the turn, and the
-  handler does not refuse it first. Run outside the suite, through the HTTP handler on a
-  Supabase stack (PostgreSQL 17.11): `{"message":"a\u0000b"}` and
-  `{"message":"a\ud800b"}` each get HTTP 200 and two frames, `meta` then `error`
-  (`server_error`). The conversation is opened, storing the message is what fails, and
-  the model is not called. An ordinary message there gets `meta`, `text`, `done`. This
-  is the store, not retrieval, and the store's code has not changed since 0.1.x. The
-  in-memory stores accept both bodies and answer `meta`, `text`, `done`, so the offline
-  suite can't show it.
+- A body holding a NUL character or an unpaired surrogate is refused with a 400 (since
+  0.3.0). Postgres stores neither as text. `POST {base}/chat` answers `400 bad_request`,
+  naming the field, when `message`, `page`, `visitor.name` or `visitor.email` holds
+  U+0000 or a surrogate that is not half of a pair, wherever in the string it sits. No
+  conversation is opened, nothing is stored or logged, and the model is not called
+  ([`test/handler.test.ts`](test/handler.test.ts)). A well-formed pair is text and is
+  answered: that is any character above U+FFFF, the emoji U+1F600 for one. So is every
+  other character. An unpaired surrogate is what a client makes by cutting text by the
+  units of a JavaScript string through a character above U+FFFF; a NUL has to be written
+  into the JSON as `\u0000`.
+  - What it was in 0.2.0. Run outside the suite, through the HTTP handler on a Supabase
+    stack (PostgreSQL 17.11). Such a `message` got HTTP 200 and two frames, `meta` then
+    `error` (`server_error`), and left a conversation with no message in it. Such a
+    `page` or `visitor` field got a stream whose only frame was `error` on a new
+    conversation, and was answered when sent into a conversation that existed, because
+    those fields are written only when a conversation is created. The in-memory stores
+    answered all of them. Each of those bodies is a 400 now.
+  - Run on the same stack with 0.3.0: each of them gets the 400, on Supabase stores and
+    on the in-memory ones, with no call to any store and no row added to
+    `agent_conversations`, `agent_messages` or `agent_events`.
+  - The rule is the stack's own. On that stack, 69,637 strings were sent to be stored,
+    through supabase-js, in a `text` column and in a `jsonb` one, and to the handler: every
+    one of the 65,536 UTF-16 units on its own, a spread of characters above U+FFFF, and
+    the character placed first, last and alone. The stack refused 2,064 of them and the
+    handler refused the same 2,064. Of the single units that is U+0000 and the 2,048
+    surrogates, and nothing else. Every row the stack accepted read back as it was sent.
+    That is one stack, PostgreSQL 17.11 behind PostgREST 16.4, and no other was run.
+  - A refused body leaves no `error` event, as no 400 does, and `onEvent` is not called.
+    If you counted these failures in `agent_events`, they stop appearing there.
+  - The check is on the request body and nothing else. `runTurn` called with no handler
+    in front checks nothing, a model's reply and a tool's input are stored as they are,
+    and the stores themselves are as they were.
 - A reply can come back empty. If the model runs out of `maxTokens` part-way through a
   tool call, the call is dropped, rightly, and the turn ends with `done` and no text. The
   `model_call` event for that turn says `stopReason: "max_tokens"`. If those show up,

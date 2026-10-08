@@ -1,6 +1,6 @@
 # agent-core — design spec
 
-**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15, §16)
+**Status:** implemented · **Date:** 2026-07-05 · **Amended:** 2026-10-07 (§11, §12, §13, §14, §15, §16), 2026-10-08 (§17)
 
 The design spec this package was built and reviewed against. `SPEC §n` in source comments
 and test names points at a section of this file. Edited for publication: references to
@@ -75,7 +75,7 @@ is testable in memory.**
 
 | Decision | Value |
 |---|---|
-| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.2.0` (was `0.1.1`; retrieval results change and three behaviours are dropped, §16) |
+| Package | `@ddj/agent-core`, `private`, ESM (`"type": "module"`), version `0.3.0` (was `0.2.0`; bodies the endpoint accepted are refused, §17. Before that `0.1.1`; retrieval results change and three behaviours are dropped, §16) |
 | Language | TypeScript `^5`, `strict: true`, build = `tsc` to `dist/`, `check` = `tsc --noEmit` |
 | Node | `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` in `engines` — the range vitest 5 declares — and `.nvmrc` = `22` (§12) |
 | Runtime deps | Exactly three: `@anthropic-ai/sdk`, `@supabase/supabase-js` (`^2.112.0`: the first release with both `db.retry` and `db.timeout`, which the store sets — §14), `zod` (v4 — use built-in `z.toJSONSchema()`) |
@@ -375,7 +375,8 @@ agent-core/
     │                              #   ingest idempotency
     ├── prompt.test.ts             # non-negotiables always present/first, tone included, context block
     ├── handler.test.ts            # SSE order, CORS, 400/403/404/405/429/500, health, mid-stream
-    │                              #   error, error-only stream when no conversation exists
+    │                              #   error, error-only stream when no conversation exists;
+    │                              #   body text Postgres cannot store → 400 (§9.41)
     ├── supabase-store.test.ts     # write order of upsertDocument against a recording fetch
     │                              #   stub (§9.19); no network, kill switch restored after
     ├── anthropic-client.test.ts   # AnthropicModelClient through the real SDK, against a
@@ -517,6 +518,8 @@ All commands from the copy's root.
    Added 2026-10-07 (§12): an unexpected failure before the stream opens → 500
    `server_error`; and the one exception to "`meta` first" — when the turn fails before
    a conversation is loaded or created, the stream is 200 with `error` as its only frame.
+   Added 2026-10-08 (§17): a string of the body holding U+0000 or an unpaired surrogate
+   → 400 `bad_request` (§9.41).
 10. **Observability:** a scripted conversation (user msg → retrieval → tool → reply)
     produces the exact expected `AgentEvent` sequence in the sink, each with
     `conversationId` and ISO timestamp; `onEvent` receives the same events; SSE `tool`
@@ -674,8 +677,9 @@ All commands from the copy's root.
 35. **A message with no meaningful word** (added 2026-10-07, §15): on real Postgres, a
     message that is empty, blank, only stop words, only punctuation or a lone minus matches
     nothing by keyword and raises nothing; the vector half answers as if nothing was typed.
-36. **Version** (added 2026-10-07, §15, as 0.1.1; **0.2.0 as of §16**): `package.json`,
-    the lockfile's two root entries, `VERSION` and `GET {base}/health` all say `0.2.0`.
+36. **Version** (added 2026-10-07, §15, as 0.1.1; 0.2.0 as of §16; **0.3.0 as of §17**):
+    `package.json`, the lockfile's two root entries, `VERSION` and `GET {base}/health` all
+    say `0.3.0`.
     A test holds `package.json` and both lockfile entries to `VERSION`, so one of them
     left behind fails the suite.
 37. **A blank `AGENT_MODEL`** (added 2026-10-07, §15): empty or only spaces, as
@@ -846,6 +850,21 @@ All commands from the copy's root.
     rank: on Postgres the Heating passage ties with Opening hours at the bottom of the
     vector half, and the order of those two is chance. KC-11 remains the fixture with the
     vector ranks set by hand.
+41. **Text in the body that Postgres cannot store** (added 2026-10-08, §17). A body in
+    which `message`, `page`, `visitor.name` or `visitor.email` holds U+0000 or an unpaired
+    surrogate gets 400 `bad_request` with a message naming the field, and the CORS header
+    every error carries. The conversation store is not called, no event is written, the
+    `onEvent` hook is not called and the model is not called; sent into a conversation
+    that exists, nothing is added to it. A surrogate counts as unpaired when it is a high
+    one with no low one after it, a low one with no high one before it, or a pair the
+    wrong way round, and it is refused wherever it sits: first, last or between. A
+    well-formed pair is text: written as two escapes or sent as UTF-8, in any of the four
+    fields, the body is answered and stored as sent. So is every other character. The
+    suite holds nine of them: five other control characters, U+FFFD, two noncharacters
+    and the last code point. Every UTF-16 unit is held by a sweep outside the suite. A
+    refused body counts against the rate limit. A message that is too long and also
+    holds a NUL gets the answer a too-long message gets. Held on the in-memory stores, by
+    `test/handler.test.ts`; on Supabase stores it is run outside the suite (§17).
 
 ## 10. Out of scope (deliberate)
 
@@ -1424,7 +1443,9 @@ ways of behaviour, each asserted where the two part:
 One more difference lies outside retrieval, and no test asserts it: the in-memory stores
 accept a message holding a NUL character or an unpaired surrogate, which a database
 behind Supabase refuses ("The limits", below). The header of `src/stores/memory.ts`
-lists the five and then this one, apart from them.
+lists the five and then this one, apart from them. (Since 0.3.0 the handler refuses a
+request body holding either before any store is called: §17. That closes it for what a
+visitor sends and for nothing else.)
 
 With the stand-in, nothing about stemming is proven, nothing about how a server indexes
 a stored passage, and nothing about what a database refuses to store. A keyword match
@@ -1471,7 +1492,8 @@ that depends on a plural or a tense is only ever exercised on real Postgres.
   a 400, is a change to the HTTP contract and is not in this one. It is the store and
   not the keyword half, and the store's code has not changed since 0.1.x; 0.1.x itself
   was not run for it. It is recorded so that nobody reads the section above as "a
-  visitor's message cannot fail the turn".
+  visitor's message cannot fail the turn". (That is 0.2.0. Since 0.3.0 the handler
+  refuses such a body with a 400 before a turn starts: §17.)
 
 **What has been measured, and what has not.** In the suite, on one server, PostgreSQL
 18.3 in the test process: everything in §9.39. Stems come from the stemmer a server
@@ -1490,7 +1512,8 @@ repository:
   applied by the Supabase CLI: 20 of 20 checks, one of which compares the
   function with a second implementation of the rule on 300 random messages.
 - Through the HTTP handler on such a stack: the two bodies of "The limits" above, a NUL
-  character and an unpaired surrogate, each of which fails the turn at the store.
+  character and an unpaired surrogate, each of which fails the turn at the store. (That
+  is 0.2.0; §17 has the same bodies run with 0.3.0.)
 
 Not measured: a Supabase project's own build; anything with Voyage embeddings or a
 Claude answer; a real business's content; real customers' phrasing; what a reranker in
@@ -1515,7 +1538,8 @@ and how to go back. The two bounds on a message, and that a pasted run of 100 or
 skipped. The servers it has been run on, by name, in the suite and outside it. The
 fault in 0.1.x, beside the upgrade note and again beside going back. The limit on a
 stored passage. That a message holding a NUL or an unpaired surrogate fails the turn at
-the store, and that the in-memory stores accept it. It does not say that answers are better or retrieval more accurate, and
+the store, and that the in-memory stores accept it (0.2.0; §17 changes both the
+behaviour and the sentence). It does not say that answers are better or retrieval more accurate, and
 it does not say of any message that it cannot raise without saying where that was run.
 
 **`src/` changes in three files:** `stores/memory.ts`, the new
@@ -1543,3 +1567,215 @@ raise its own error.
 **Not in this change.** Any weighting of words; phrase search as an option; a relevance
 floor on the vector half; an order for ties in the fused score; a stemmer in the
 stand-in; content that is not English; the reranker.
+
+## 17. Amendment — 2026-10-08, text in the request body that Postgres cannot store
+
+**Why.** §16 recorded a limit and left it open: the handler accepted a message holding
+U+0000 or an unpaired surrogate, and the turn failed at the store. This closes it. The
+handler refuses such a body with a 400. That changes what a client gets for a request it
+could send before, so this section says exactly what changes, and the version is 0.3.0.
+
+**Measured first, on 0.2.0.** Outside the suite, through the real handler on a Supabase
+stack: PostgreSQL 17.11, pgvector 0.8.2, PostgREST 16.4, both migration files applied by
+the Supabase CLI. Rows were counted in the database before and after each request.
+
+| U+0000 or an unpaired surrogate in | Supabase stores | In-memory stores |
+| --- | --- | --- |
+| `message` | 200; `meta` then `error`. Left behind: one conversation row holding no message, and two event rows (`conversation_started`, `error`). Model not called. | 200; `meta`, `text`, `done` |
+| `page`, `visitor.name` or `visitor.email`, on a new conversation | 200; `error` as the only frame. No conversation row; one `error` event row with no conversation. Model not called. | 200; `meta`, `text`, `done` |
+| `page` or `visitor.name`, sent into a conversation that exists | 200; `meta`, `text`, `done`. The turn is answered: those fields are written only when a conversation is created. | 200; `meta`, `text`, `done` |
+
+The store's own words for the two: `unsupported Unicode escape sequence` for the NUL, and
+`Empty or invalid json` for the surrogate. On both kinds of store a well-formed pair is
+answered, written as two escapes (`\ud83d\ude00`) or sent as UTF-8. Two shapes never reach
+a string at all, run on the 0.2.0 handler with the in-memory stores: a raw NUL byte in the
+body is already a 400, because it is not valid JSON, and the raw bytes of a surrogate are
+decoded to U+FFFD, which is ordinary text. So only the JSON escapes `\u0000` and `\ud800`
+to `\udfff` put these into a string.
+
+**The rule.** `POST {base}/chat` refuses a body in which `message`, `page`,
+`visitor.name` or `visitor.email` holds U+0000, or a surrogate that is not half of a
+well-formed pair (a high one followed at once by a low one). It does not matter where in
+the string it sits. Nothing else is refused by this rule: other control characters,
+noncharacters and everything above U+FFFF are answered. That this is exactly the text the
+stack refuses was measured: "How it was checked", below.
+
+**Why all four strings, and not only `message`.** By reading what the stores write
+(`src/stores/supabase.ts`) and by the table above. `create` writes `page` to a `text`
+column and `visitor` to a `jsonb` one; `appendMessage` writes `message` to a `text`
+column; the event payloads, `jsonb`, carry all four. The same two characters fail the
+same way in each. `conversationId` needs nothing: it must already be a UUID.
+
+**The rule does not look at the store, or at whether the conversation exists.** A client
+cannot know either, and what a body is answered with should not depend on them. The cost
+is the third row of the table: such a `page` or `visitor` field sent into a conversation
+that exists was answered, and is now refused.
+
+**The response.** The existing 400: status 400, `content-type: application/json`, the
+CORS headers every error carries, and the body
+
+```json
+{"error":{"code":"bad_request","message":"The message field holds a character that cannot be stored as text: U+0000 or an unpaired surrogate."}}
+```
+
+with the field named as `message`, `page`, `visitor.name` or `visitor.email`. No new
+status, code, header or shape. The check sits where the other 400s are decided, in the
+body schema: after the origin check and the rate limit, so a refused body counts against
+the limit as an oversized one does, and before any stream is opened. The length checks on
+`message` answer first, so a message that is empty or too long gets the message it got
+before. Across fields the first field at fault answers, as it always did, so a body with
+two faults can get different words than in 0.2.0: `{"message":"a\u0000b","conversationId":"nope"}`
+got `Invalid UUID` and now gets the message naming `message` (run on both versions). The
+status and the code are the same. No conversation is loaded or created, no message or
+event is stored, `onEvent` is not called, and the model is not called.
+
+**What changes for a client or a deployment.** This is a behaviour change, in five ways.
+
+1. Such a `message`, on the Supabase stores: was a 200 stream of `meta` then `error`
+   (`server_error`), now a 400. The empty conversation and its two event rows are no
+   longer written. No such message was ever answered there.
+2. Such a `page` or `visitor` field on a new conversation, on the Supabase stores: was a
+   200 stream whose only frame is `error`, now a 400.
+3. Such a `page` or `visitor` field sent into a conversation that exists: was answered,
+   now a 400. This is the one request that completed a turn on the Supabase stores and no
+   longer does.
+4. On the in-memory stores, or on a deployment's own stores if they accept such text:
+   every one of these bodies was answered, and now gets a 400.
+5. A refused body leaves no `error` event, as no 400 does. A deployment that counted
+   these failures in `agent_events` stops seeing them there.
+
+Where such a body comes from. A NUL: a client that writes `\u0000` into its JSON. An
+unpaired surrogate: a client that cuts text by the units of a JavaScript string through
+the middle of a character above U+FFFF. `'ab\u{1F600}'.slice(0, 3)` ends in one.
+
+**The contract: within `protocolVersion: 1`, with the contract's text changed.**
+[`http-contract.md`](http-contract.md) freezes its identifiers: event names, JSON shapes,
+status codes and headers. None is added, removed or altered. `400 bad_request` and its
+body were already in it, and a client written for version 1 already has to handle them
+from this endpoint. The 0.2.0 handler already answered 400 for bodies the contract's list
+did not name: a `conversationId` that is not a UUID, a field of the wrong type. No frame,
+header or successful response changes. What does change is which bodies are valid, and
+the contract now says so, in its description of the body and in its list of 400 cases,
+with the version the case arrived in.
+
+A stricter reading is possible: for these bodies the status code changes from 200 to 400,
+and the contract says status codes do not change without a bump. This release takes the
+first reading. A reader who holds the second should treat 0.3.0 as the point where the
+contract moved.
+
+**Considered and not built: repairing the text.** A surrogate that arrives as raw bytes is
+already turned into U+FFFD, by the decoder that reads the body, and the turn is answered.
+The handler could do the same to an escaped one. That would turn a turn that failed into
+one that is answered, with no question about the contract or the version, and a visitor
+whose client cut a character in half would get a reply where the refusal gives them an
+error until the text changes. It was not built, for three reasons. The repair has a
+precedent for the surrogate only: the decoder already makes it for raw bytes, and nothing
+repairs a NUL, so a NUL would still need a rule of its own. A repair is silent: the
+stored message and the one the model reads would no longer be the one sent, and the
+client that cut the character would never be told. And a refusal is one rule for both
+characters and all four fields, which names the field at fault.
+
+**Version 0.3.0.** §15 gave a patch number to a compatible addition, one where nothing
+published changes behaviour. This is not one: bodies the endpoint accepted are refused.
+So the minor number moves, as it did in §16.
+Nothing has to be applied, migrated or ingested again.
+
+**The exact change.**
+
+1. **`src/http/handler.ts`.** One pattern, `/[\u0000\uD800-\uDFFF]/u`, and one helper that
+   adds the refusal to a string of the body schema. The `u` flag is what keeps a
+   well-formed pair out of it: with the flag the pattern reads whole characters, and a
+   pair is one character above U+FFFF. `String.prototype.isWellFormed` would say the same
+   and is not in the `ES2023` library this package compiles against.
+2. **`src/config.ts`.** `VERSION` is `0.3.0`. With it: `package.json`, both root entries
+   of the lockfile, the health test.
+3. **`src/stores/memory.ts`, a comment.** Its header says what these stores accept that a
+   database refuses. It now also says the handler refuses such a body first.
+4. **Tests** (§9.41, `test/handler.test.ts`), twenty-one of them: 201 in 13 files, where
+   there were 180. Each of the four strings, with a NUL and with an unpaired surrogate,
+   gets the 400 naming it, with the CORS header an error carries, and nothing is touched:
+   no call to the conversation store, no event, the `onEvent` hook not called, no model
+   call. `message` also with a lone low surrogate, with a pair the wrong way round, and
+   with the character where the string ends or starts: a lone high surrogate last, a lone
+   low one first, a NUL last. The bodies `{"message":"a\u0000b"}` and
+   `{"message":"a\ud800b"}` are sent as those exact bytes. A well-formed pair, written as
+   two escapes and as UTF-8, in every field: answered, and stored as sent. Every other
+   character is text: a body holding a line feed, a tab, U+0001, U+001F, U+007F, U+FFFD,
+   U+FFFE, U+FFFF and U+10FFFF in every field is answered and stored as sent. A `page`
+   field, a `visitor.name` field and a `visitor.email` field, each sent into a
+   conversation that exists: 400, and nothing is added to it. A refused body counts
+   against the rate limit. A message that is too long and also holds a NUL gets the
+   answer a too-long one gets.
+5. **The words.** §3, §9.9, §9.36 and §9.41 here, and four sentences of §16 marked where
+   they describe 0.2.0. The README: the operating note, the stand-in table, the test
+   table and counts, an upgrade note, and the sentence under "Applying the migrations"
+   that pointed at the old limit. `http-contract.md`.
+
+**`src/` changes in two files as compiled:** `http/handler.js` and `config.js`.
+`stores/memory.js` is unchanged once comments are stripped.
+
+**How it was checked.** As §13 to §16. Twenty-four deliberate breaks, each applied to a
+copy, confirmed in the file and run against the whole suite, and each turned red exactly
+the tests named for it and no others. The check removed from each of the four fields.
+The `u` flag removed, which lands the check on well-formed pairs and turns the tests of
+them red while every refusal stays green. U+0000 taken out of the pattern, then the
+surrogates, then only the low ones, then only the high ones. The 400 sent after a
+conversation is opened, after an event is written, after the hook is called, after the
+model is called, and without the CORS header: each is still a 400 and fails on what was
+touched or left off. The check moved ahead of the rate limit, and ahead of the length
+check. The wrong field named. The version left behind. And six wrong versions of the
+rule that review found the tests of the time blind to (the second "Changed before
+release", below).
+
+Outside the suite, on the Supabase stack of the table above, with 0.3.0:
+
+- Through the handler: fifteen bodies each get the 400 on Supabase stores and on the
+  in-memory ones, twelve of the kinds the table lists and three with the character first
+  or last in `message`, with no call to any of the three stores, reads included, and no
+  row gained in
+  `agent_conversations`, `agent_messages` or `agent_events`. Seven bodies are answered on
+  both, as they are by 0.2.0 on the same stack: an ordinary message, a well-formed pair
+  written as two escapes and as UTF-8, a second message into a conversation that exists,
+  one holding the other control characters and noncharacters in every field, and two
+  with a long unbroken word.
+- The rule against the stack itself. 69,637 strings were sent to be stored, through
+  supabase-js, in a `text` column (`agent_messages.content`) and in a `jsonb` one
+  (`agent_events.payload`),
+  each both ways a request can be shaped: in batches as a JSON array, and one object a
+  request, which is the stores' own shape. The strings: every one of the 65,536 UTF-16
+  units on its own between two letters; 4,082 characters above U+FFFF; and nineteen with
+  the character first, last, alone or in a broken sequence. The stack refused 2,064 in
+  each of the four passes, the same 2,064 each time, and the handler refused those 2,064
+  and no other. Of the single units that is U+0000 and the 2,048 surrogates. Every row
+  the stack accepted read back equal to what was sent. The stack's words, with the code
+  each came with: for a NUL, `unsupported Unicode escape sequence`, code `22P05`; for a
+  surrogate, `invalid input syntax for type json`, code `22P02`, when the body is an
+  array, and `Empty or invalid json`, code `PGRST102`, when the body is an object. A
+  five-character code is Postgres's own; one that starts with `PGRST` is the API's in
+  front of it.
+
+That is one stack: PostgreSQL 17.11 behind PostgREST 16.4. No other server was run for
+this, and a Supabase project's own build is not one of them.
+
+**Changed before release.** A review of the first build found the code correct and two
+sentences wider than what had been run. One said the in-memory stores' difference "shows
+only with no handler in front"; with the handler in front, a model's reply and a tool's
+input still reach the stores unchecked. The other said the checks that were already there
+answer first; that holds for the length checks on `message` and not across fields. Both
+are narrowed above. The same review found five wrong versions of the rule that left the
+first fifteen tests green: every control character refused; the character let through
+when it ends the string; U+FFFD to U+FFFF refused; a low surrogate let through when it
+starts the string; the visitor fields not looked at when a `conversationId` is sent.
+Five tests were added, and each of those five is now a break that turns red. The sweep
+of every UTF-16 unit against the stack was run after that review, so that "nothing else
+is refused" rests on a measurement. A second read found one more, `visitor.email` not
+looked at when a `conversationId` is sent, and one more test and break closed it.
+
+**Not in this change.** `runTurn` called directly, with no handler in front: nothing is
+checked there. The stores: the in-memory ones still accept such text and Supabase still
+refuses it. Text that does not come from the request body: a model's reply and a tool's
+input are stored too, and are not checked. Ingested content is one such text, and one
+case of it was run, offline: the chunker cuts a long paragraph with no break in it by
+the units of a JavaScript string, and on a paragraph made of characters above U+FFFF it
+left chunks holding an unpaired surrogate. What a store does with such a chunk was not
+run. A bound on the length of `page` or of a `visitor` field.

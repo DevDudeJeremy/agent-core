@@ -20,7 +20,7 @@ import { requestHandoff } from './tools/request-handoff.js';
 import type { Reranker } from './rag/retrieve.js';
 
 /** Keep in sync with package.json `version`. Surfaced by GET {base}/health. */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 export const PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_MODEL = 'claude-haiku-4-5';
 

@@ -12,6 +12,19 @@ import { corsHeaders, isOriginAllowed } from './cors.js';
 import { SlidingWindowRateLimiter, type RateLimiter } from './rate-limit.js';
 import { encodeFrame, SSE_HEADERS, SSE_KEEPALIVE, SSE_KEEPALIVE_MS, type SseFrame } from './sse.js';
 
+/**
+ * Text Postgres cannot store: U+0000, and a surrogate that is not half of a pair. The `u`
+ * flag makes the class read whole characters, so a well-formed pair, which is one character
+ * above U+FFFF, does not match. Without the flag every such character would be refused.
+ */
+const UNSTORABLE = /[\u0000\uD800-\uDFFF]/u;
+
+/** A string of the request body, refused when it holds text Postgres cannot store. */
+const storable = (field: string, base: z.ZodString = z.string()): z.ZodString =>
+  base.refine((s) => !UNSTORABLE.test(s), {
+    message: `The ${field} field holds a character that cannot be stored as text: U+0000 or an unpaired surrogate.`,
+  });
+
 export function createAgentHandler(
   agent: ResolvedAgentConfig,
 ): (req: Request) => Promise<Response> {
@@ -21,11 +34,18 @@ export function createAgentHandler(
   );
   const base = agent.http.basePath;
 
+  // Every string a store writes is checked (SPEC §9.41), and the stores write all four. The
+  // length checks come first, so a body they refuse keeps the answer it always had.
   const bodySchema = z.object({
-    message: z.string().min(1).max(agent.limits.maxMessageChars),
+    message: storable('message', z.string().min(1).max(agent.limits.maxMessageChars)),
     conversationId: z.uuid().optional(),
-    page: z.string().optional(),
-    visitor: z.object({ name: z.string().optional(), email: z.string().optional() }).optional(),
+    page: storable('page').optional(),
+    visitor: z
+      .object({
+        name: storable('visitor.name').optional(),
+        email: storable('visitor.email').optional(),
+      })
+      .optional(),
   });
 
   const errorJson = (

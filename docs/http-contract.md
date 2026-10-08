@@ -32,6 +32,12 @@ allowlist says, so a page on any origin can read it: it is public and holds no s
 }
 ```
 
+None of the body's four strings (`message`, `page`, `visitor.name`, `visitor.email`) may
+hold U+0000, or a surrogate that is not half of a well-formed pair. Postgres stores
+neither as text, so a body holding one is refused with `400 bad_request` (§4) before a
+conversation is loaded or created, whatever store is behind the handler. A well-formed
+pair, which is any character above U+FFFF, is text, and so is every other character.
+
 Success → `200` with `Content-Type: text/event-stream`, `Cache-Control: no-store`,
 `X-Accel-Buffering: no`.
 
@@ -56,10 +62,20 @@ conversation id to announce, and the stream is `200` with `error` as its only fr
 ## 4. Non-stream errors
 
 JSON body `{"error":{"code":"...","message":"..."}}` with: `400 bad_request` (missing or
-oversized `message`, malformed JSON) · `403 origin_forbidden` (Origin not in allowlist) ·
+oversized `message`, malformed JSON, a string holding U+0000 or an unpaired surrogate) ·
+`403 origin_forbidden` (Origin not in allowlist) ·
 `404` unknown path under the base · `405` wrong method · `429 rate_limited` (includes
 `Retry-After` header; default limit 20 req/min/IP) · `500 server_error`. `OPTIONS`
 preflight → `204` with CORS headers when the Origin is allowed.
+
+The last of those 400 cases was added in version 0.3.0, within protocolVersion 1: no
+event name, JSON shape, status code or header is new. What changed is the answer to those
+bodies. Before 0.3.0 the handler accepted them and the answer depended on the store. Some
+of them were answered, with `meta`, `text`, `done`: every one of them on the in-memory
+stores, and on the Supabase stores a `page` or `visitor` field like that when it was sent
+into a conversation that already existed. Those are a `400` now. The rest already failed
+on the Supabase stores, as a `200` stream ending in `error`. The README's operating notes
+list each case.
 
 ## 5. Server-side env (agent host — never exposed to the browser)
 
