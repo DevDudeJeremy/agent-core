@@ -2142,9 +2142,9 @@ guarantees are for whole-number sizes. The fourth, of the release as rebuilt on
 0.3.0, found words and no code. A row of §9 still gave the version as 0.3.0. The
 upgrade note in the README and the paragraph on the version, below, said that a
 document left without chunks is stored by the next ingest run, where one folder had
-been run, and said nothing of a store that had accepted the malformed chunk. And this
-section named `npm run ingest` where the script had been run directly. Each says what
-was run now.
+been run, and said nothing of a store that had accepted the malformed chunk. One more
+was found while those were being changed, and not by that reading: this section named
+`npm run ingest` where the script had been run directly. Each says what was run now.
 
 **The version.** 0.3.1. A patch number: this is a fix, and no interface changes. Nothing
 has to be applied or migrated. What it means for documents that are already ingested is

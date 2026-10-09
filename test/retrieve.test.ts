@@ -131,14 +131,19 @@ describe('RRF constants are pinned (SPEC §9.16)', () => {
       .sort();
 
     // A published file is never edited. Someone may have applied it, and a migration tool
-    // that tracks files by name would not run an edited one again. A change is a new file,
-    // and its hash joins this list in the commit that publishes it.
+    // that tracks files by name would not run an edited one again. A change is a new file.
+    // Every file in the folder is in this list with its hash, and the list holds nothing
+    // else: a file cannot be added without one. So a new file's hash joins the list in the
+    // commit that adds the file, and until that file is published an edit to it moves its
+    // hash here in the same commit.
     const PUBLISHED: Record<string, string> = {
       '20260705000000_agent_core.sql':
         '653d2858de75addeb1d8f490a0357aa525fff3b736539856c49afecffb38a47b',
+      '20261007000000_agent_core_keyword_majority.sql':
+        'b42c43c532058b04de533d34c3670e87fe0d1b8093734aef0da7ebef41836d0f',
     };
+    expect(files).toEqual(Object.keys(PUBLISHED).sort());
     for (const [name, sha256] of Object.entries(PUBLISHED)) {
-      expect(files).toContain(name);
       const bytes = readFileSync(new URL(name, dir));
       expect(createHash('sha256').update(bytes).digest('hex'), name).toBe(sha256);
     }

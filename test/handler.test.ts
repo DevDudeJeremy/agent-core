@@ -441,3 +441,104 @@ describe('text in the body that Postgres cannot store (SPEC §9.41)', () => {
     expect(await errBody(both)).toEqual(await errBody(tooLong));
   });
 });
+
+describe('request bodies refused with 400 before anything is touched', () => {
+  /** A conversation store that writes down the name of every call made to it. */
+  function watchedStore(): { store: ConversationStore; calls: string[] } {
+    const inner = createMemoryStores().conversations;
+    const calls: string[] = [];
+    const store = new Proxy(inner, {
+      get(target, name, receiver) {
+        const member: unknown = Reflect.get(target, name, receiver);
+        if (typeof member !== 'function') return member;
+        return (...args: unknown[]): unknown => {
+          calls.push(String(name));
+          return (member as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    });
+    return { store, calls };
+  }
+
+  async function send(body: string): Promise<{
+    res: Response;
+    calls: string[];
+    events: MemoryEventSink;
+    heard: AgentEvent[];
+    model: MockModelClient;
+  }> {
+    const model = new MockModelClient([[textDelta('ok'), stop('end_turn')]]);
+    const { store, calls } = watchedStore();
+    const events = new MemoryEventSink();
+    const heard: AgentEvent[] = [];
+    const onEvent = (e: AgentEvent): void => {
+      heard.push(e);
+    };
+    const handler = makeHandler(model, { conversations: store, events, onEvent });
+    return { res: await handler(chatReq(body)), calls, events, heard, model };
+  }
+
+  // [what is wrong, how, the body exactly as it goes on the wire]. One row or more for each
+  // kind in the contract's list of 400 bodies, but the last: a string holding text that
+  // cannot be stored is held the same way above (SPEC §9.41). Two older tests above ask a
+  // body that is not JSON and a message that is too long for the 400 alone; their rows
+  // here ask that nothing is touched as well.
+  const REFUSED: Array<[string, string, string]> = [
+    ['the body', 'not JSON', '{not json'],
+    ['the body', 'an array', '[]'],
+    ['the body', 'an array holding a body', '[{"message":"hi"}]'],
+    ['the body', 'a string', '"hi"'],
+    ['the body', 'a number', '5'],
+    ['the body', 'null', 'null'],
+    ['message', 'absent', '{}'],
+    ['message', 'empty', '{"message":""}'],
+    ['message', 'null', '{"message":null}'],
+    ['message', 'a number', '{"message":5}'],
+    ['message', 'an array', '{"message":["hi"]}'],
+    ['message', 'of 2,001 characters', `{"message":"${'x'.repeat(2001)}"}`],
+    ['conversationId', 'not a UUID', '{"message":"hi","conversationId":"nope"}'],
+    ['conversationId', 'an empty string', '{"message":"hi","conversationId":""}'],
+    ['conversationId', 'a number', '{"message":"hi","conversationId":5}'],
+    ['conversationId', 'null', '{"message":"hi","conversationId":null}'],
+    ['page', 'a number', '{"message":"hi","page":5}'],
+    ['page', 'null', '{"message":"hi","page":null}'],
+    ['visitor', 'a string', '{"message":"hi","visitor":"Ada"}'],
+    ['visitor', 'an array', '{"message":"hi","visitor":[]}'],
+    ['visitor', 'null', '{"message":"hi","visitor":null}'],
+    ['visitor.name', 'a number', '{"message":"hi","visitor":{"name":5}}'],
+    ['visitor.email', 'a number', '{"message":"hi","visitor":{"email":5}}'],
+  ];
+
+  it.each(REFUSED)(
+    '%s, %s → 400 bad_request, and nothing is touched',
+    async (_field, _how, body) => {
+      const { res, calls, events, heard, model } = await send(body);
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('content-type')).toBe('application/json');
+      expect(res.headers.get('access-control-allow-origin')).toBe(ORIGIN);
+      expect(await errBody(res)).toEqual({
+        error: { code: 'bad_request', message: expect.any(String) },
+      });
+      // No conversation loaded or created, nothing stored, nothing logged, the hook not
+      // called, no model call.
+      expect(calls).toEqual([]);
+      expect(events.events).toEqual([]);
+      expect(heard).toEqual([]);
+      expect(model.calls).toEqual([]);
+    },
+  );
+
+  it('control: a well-formed body with every field is answered, and each of those four is touched', async () => {
+    const { res, calls, events, heard, model } = await send(
+      '{"message":"hi","conversationId":"3f2b8c1e-5d47-4a6b-9c0d-1e2f3a4b5c6d","page":"/a","visitor":{"name":"Ada","email":"ada@x.example"}}',
+    );
+
+    expect(res.status).toBe(200);
+    expect((await readSSE(res)).map((f) => f.event)).toEqual(['meta', 'text', 'done']);
+    expect(calls).toEqual(expect.arrayContaining(['create', 'appendMessage']));
+    expect(events.events).not.toEqual([]);
+    expect(heard).not.toEqual([]);
+    expect(model.calls).toHaveLength(1);
+  });
+});

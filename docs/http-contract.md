@@ -61,8 +61,10 @@ conversation id to announce, and the stream is `200` with `error` as its only fr
 
 ## 4. Non-stream errors
 
-JSON body `{"error":{"code":"...","message":"..."}}` with: `400 bad_request` (missing or
-oversized `message`, malformed JSON, a string holding U+0000 or an unpaired surrogate) ·
+JSON body `{"error":{"code":"...","message":"..."}}` with: `400 bad_request` (a body that
+is not JSON, or is JSON and not an object; a missing, empty or oversized `message`; a
+field of the wrong type, `null` included; a `conversationId` that is not a UUID; a string
+holding U+0000 or an unpaired surrogate) ·
 `403 origin_forbidden` (Origin not in allowlist) ·
 `404` unknown path under the base · `405` wrong method · `429 rate_limited` (includes
 `Retry-After` header; default limit 20 req/min/IP) · `500 server_error`. `OPTIONS`
@@ -76,6 +78,11 @@ stores, and on the Supabase stores a `page` or `visitor` field like that when it
 into a conversation that already existed. Those are a `400` now. The rest already failed
 on the Supabase stores, as a `200` stream ending in `error`. The README's operating notes
 list each case.
+
+The 400 cases before that one are not new. From version 0.1.0 on, and still in 0.3.1 as
+first published, this list named three of them: a missing or oversized `message`, and
+malformed JSON. It was completed by sending the handler each kind of body, with no
+change to the handler, and `test/handler.test.ts` holds each kind.
 
 ## 5. Server-side env (agent host — never exposed to the browser)
 
